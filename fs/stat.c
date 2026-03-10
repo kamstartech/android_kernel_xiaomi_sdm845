@@ -18,6 +18,8 @@
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 
+#include "mount.h"
+
 void generic_fillattr(struct inode *inode, struct kstat *stat)
 {
 	stat->dev = inode->i_sb->s_dev;
@@ -508,3 +510,93 @@ void inode_set_bytes(struct inode *inode, loff_t bytes)
 }
 
 EXPORT_SYMBOL(inode_set_bytes);
+
+/**
+ * cp_statx - copy kstat to userspace statx buffer
+ * @mnt: vfsmount for mount ID
+ * @stat: kernel stat data
+ * @buffer: userspace statx buffer
+ *
+ * Converts a kernel kstat structure into a userspace struct statx,
+ * including the mount ID from the vfsmount.
+ */
+static int cp_statx(struct vfsmount *mnt, struct kstat *stat,
+		    struct statx __user *buffer)
+{
+	struct statx tmp;
+
+	memset(&tmp, 0, sizeof(tmp));
+
+	tmp.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
+	tmp.stx_blksize = stat->blksize;
+	tmp.stx_nlink = stat->nlink;
+	tmp.stx_uid = from_kuid_munged(current_user_ns(), stat->uid);
+	tmp.stx_gid = from_kgid_munged(current_user_ns(), stat->gid);
+	tmp.stx_mode = stat->mode;
+	tmp.stx_ino = stat->ino;
+	tmp.stx_size = stat->size;
+	tmp.stx_blocks = stat->blocks;
+	tmp.stx_attributes_mask = 0;
+	tmp.stx_atime.tv_sec = stat->atime.tv_sec;
+	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
+	tmp.stx_btime.tv_sec = 0;
+	tmp.stx_btime.tv_nsec = 0;
+	tmp.stx_ctime.tv_sec = stat->ctime.tv_sec;
+	tmp.stx_ctime.tv_nsec = stat->ctime.tv_nsec;
+	tmp.stx_mtime.tv_sec = stat->mtime.tv_sec;
+	tmp.stx_mtime.tv_nsec = stat->mtime.tv_nsec;
+	tmp.stx_rdev_major = MAJOR(stat->rdev);
+	tmp.stx_rdev_minor = MINOR(stat->rdev);
+	tmp.stx_dev_major = MAJOR(stat->dev);
+	tmp.stx_dev_minor = MINOR(stat->dev);
+	tmp.stx_mnt_id = real_mount(mnt)->mnt_id;
+
+	if (copy_to_user(buffer, &tmp, sizeof(tmp)))
+		return -EFAULT;
+	return 0;
+}
+
+/**
+ * sys_statx - extended file status syscall (backported from 4.11+/5.8+)
+ * @dfd: directory file descriptor (or AT_FDCWD)
+ * @filename: file path to stat
+ * @flags: AT_* flags (AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, AT_NO_AUTOMOUNT,
+ *         AT_STATX_SYNC_TYPE)
+ * @mask: STATX_* mask indicating which fields to populate
+ * @buffer: userspace statx buffer
+ */
+SYSCALL_DEFINE5(statx,
+		int, dfd, const char __user *, filename, unsigned, flags,
+		unsigned int, mask, struct statx __user *, buffer)
+{
+	struct path path;
+	struct kstat stat;
+	int error;
+	unsigned int lookup_flags = 0;
+
+	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
+		      AT_STATX_SYNC_TYPE))
+		return -EINVAL;
+
+	if (!(flags & AT_SYMLINK_NOFOLLOW))
+		lookup_flags |= LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+	if (!(flags & AT_NO_AUTOMOUNT))
+		lookup_flags |= LOOKUP_AUTOMOUNT;
+retry:
+	error = user_path_at(dfd, filename, lookup_flags, &path);
+	if (error)
+		return error;
+
+	error = vfs_getattr(&path, &stat);
+	if (!error)
+		error = cp_statx(path.mnt, &stat, buffer);
+
+	path_put(&path);
+	if (retry_estale(error, lookup_flags)) {
+		lookup_flags |= LOOKUP_REVAL;
+		goto retry;
+	}
+	return error;
+}
