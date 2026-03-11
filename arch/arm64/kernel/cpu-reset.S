@@ -38,9 +38,10 @@ ENTRY(__cpu_soft_restart)
 	ldr	x13, =SCTLR_ELx_FLAGS
 	bic	x12, x12, x13
 	msr	sctlr_el1, x12
+        dsb	sy
 	isb
 
-	cbz	x0, 1f				// el2_switch?
+	b	1f				// el2_switch?
 	mov	x0, #HVC_SOFT_RESTART
 	hvc	#0				// no return
 

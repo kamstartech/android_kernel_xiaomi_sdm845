@@ -100,16 +100,15 @@ ENTRY(arm64_relocate_new_kernel)
 
 .Ldone:
 	/* wait for writes from copy_page to finish */
-	dsb	nsh
+	dsb	sy
 	ic	iallu
-	dsb	nsh
+	dsb	sy
 	isb
 
-	/* Start new image. */
-	mov	x0, xzr
-	mov	x1, xzr
-	mov	x2, xzr
-	mov	x3, xzr
+	 // mov	x0, xzr
+	 // mov	x1, xzr
+	 // mov	x2, xzr
+	 // mov	x3, xzr
 	br	x17
 
 ENDPROC(arm64_relocate_new_kernel)

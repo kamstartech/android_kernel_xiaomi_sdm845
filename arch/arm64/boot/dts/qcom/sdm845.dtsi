@@ -653,6 +653,20 @@
 			size = <0 0x2000000>;
 			linux,cma-default;
 		};
+		ramoops_mem: ramoops_region@9fd00000 { 
+			compatible = "removed-dma-pool"; 
+			no-map; 
+			reg = <0 0x9fd00000 0 0x00100000>; 
+		};
+	};
+
+	ramoops { 
+		compatible = "ramoops"; 
+		memory-region = <&ramoops_mem>; 
+		record-size = <0x20000>; 
+		console-size = <0x20000>; 
+		ftrace-size = <0x20000>; 
+		pmsg-size = <0x20000>; 
 	};
 };
 

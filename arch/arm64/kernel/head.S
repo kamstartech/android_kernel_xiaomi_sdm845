@@ -219,6 +219,23 @@ efi_header_end:
 	 *  x19/x20    __primary_switch()         callee preserved temp registers
 	 */
 ENTRY(stext)
+	/* KEXEC HARDBOOT INTERCEPT */ 
+	movz	x4, #0x0000 
+	movk	x4, #0x9fd0, lsl #16 
+	ldr	w5, [x4] 
+	movz	w6, #0x4f54 
+	movk	w6, #0x4842, lsl #16 
+	cmp	w5, w6 
+	b.ne	.Lno_hardboot 
+	ldr	x0, [x4, #8] 
+	ldr	x1, [x4, #16] 
+	ldr	x2, [x4, #24] 
+	ldr	x3, [x4, #32] 
+	ldr	x12, [x4, #40] 
+	mov	w5, #0 
+	str	w5, [x4] 
+	br	x12 
+.Lno_hardboot:
 	bl	preserve_boot_args
 	bl	el2_setup			// Drop to EL1, w0=cpu_boot_mode
 	adrp	x23, __PHYS_OFFSET

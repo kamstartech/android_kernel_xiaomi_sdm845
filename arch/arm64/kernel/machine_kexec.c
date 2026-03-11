@@ -9,6 +9,9 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/delay.h>
+#include <linux/io.h>
+#include <linux/input/qpnp-power-on.h>
 #include <linux/kexec.h>
 #include <linux/smp.h>
 
@@ -148,7 +151,7 @@ void machine_kexec(struct kimage *kimage)
 	/*
 	 * New cpus may have become stuck_in_kernel after we loaded the image.
 	 */
-	BUG_ON(cpus_are_stuck_in_kernel() || (num_online_cpus() > 1));
+	WARN_ON(cpus_are_stuck_in_kernel() || (num_online_cpus() > 1));
 
 	reboot_code_buffer_phys = page_to_phys(kimage->control_code_page);
 	reboot_code_buffer = phys_to_virt(reboot_code_buffer_phys);
@@ -188,6 +191,7 @@ void machine_kexec(struct kimage *kimage)
 		kexec_segment_flush(kimage);
 
 	pr_info("Bye!\n");
+        mdelay(100);
 
 	/* Disable all DAIF exceptions. */
 	asm volatile ("msr daifset, #0xf" : : : "memory");
@@ -201,7 +205,22 @@ void machine_kexec(struct kimage *kimage)
 	 * relocation is complete.
 	 */
 
-	cpu_soft_restart(1, reboot_code_buffer_phys, kimage->head,
+	/* HARDBOOT SIGNALING */ 
+	{ 
+		void __iomem *imem = ioremap(0x9fd00000, 0x1000); 
+		if (imem) { 
+			writeq(kimage->head, imem + 8); 
+			writeq(kimage_start, imem + 16); 
+			writeq(0, imem + 24); 
+			writeq(0, imem + 32); 
+			writeq(reboot_code_buffer_phys, imem + 40); 
+			writel(0x48424f54, imem); 
+			pr_emerg("KEXEC: Hardboot signaled. Warm reset in progress...\n"); 
+			mdelay(200); 
+			qpnp_pon_system_pwr_off(PON_POWER_OFF_WARM_RESET); 
+		} 
+	}
+	cpu_soft_restart(0, reboot_code_buffer_phys, kimage->head,
 		kimage_start, 0);
 
 	BUG(); /* Should never get here. */
