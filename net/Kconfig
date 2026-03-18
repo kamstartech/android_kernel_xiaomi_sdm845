@@ -437,6 +437,8 @@ config MAY_USE_DEVLINK
 
 source "net/ipc_router/Kconfig"
 
+source "net/wireguard/Kconfig"
+
 endif   # if NET
 
 # Used by archs to tell that they support BPF JIT compiler plus which flavour.
