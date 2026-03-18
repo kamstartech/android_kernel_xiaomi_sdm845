@@ -666,6 +666,15 @@ config TCP_CONG_BBR
 	bufferbloat, policers, or AQM schemes that do not provide a delay
 	signal. It requires the fq ("Fair Queue") pacing packet scheduler.
 
+config TCP_CONG_BBR2
+	tristate "BBRv2 TCP"
+	default n
+	---help---
+	  BBRv2 (Bottleneck Bandwidth and RTT version 2) congestion control.
+	  This is the second generation of BBR, which adds explicit support
+	  for packet loss and ECN signals. It aims to improve fairness and
+	  performance on links with high loss or multiple competing flows.
+
 choice
 	prompt "Default TCP congestion control"
 	default DEFAULT_CUBIC
@@ -702,6 +711,9 @@ choice
 
 	config DEFAULT_BBR
 		bool "BBR" if TCP_CONG_BBR=y
+
+	config DEFAULT_BBR2
+		bool "BBRv2" if TCP_CONG_BBR2=y
 
 	config DEFAULT_RENO
 		bool "Reno"
