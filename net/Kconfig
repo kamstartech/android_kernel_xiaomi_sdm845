@@ -437,7 +437,7 @@ config MAY_USE_DEVLINK
 
 source "net/ipc_router/Kconfig"
 
-source "net/wireguard/Kconfig"
+source "net/wireguard/src/Kconfig"
 
 endif   # if NET
 
