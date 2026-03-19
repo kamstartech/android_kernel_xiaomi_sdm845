@@ -2806,12 +2806,9 @@ EXPORT_SYMBOL(sched_set_wake_up_idle);
 
 /* Precomputed fixed inverse multiplies for multiplication by y^n */
 static const u32 runnable_avg_yN_inv[] = {
-	0xffffffff, 0xfa83b2da, 0xf5257d14, 0xefe4b99a, 0xeac0c6e6, 0xe5b906e6,
-	0xe0ccdeeb, 0xdbfbb796, 0xd744fcc9, 0xd2a81d91, 0xce248c14, 0xc9b9bd85,
-	0xc5672a10, 0xc12c4cc9, 0xbd08a39e, 0xb8fbaf46, 0xb504f333, 0xb123f581,
-	0xad583ee9, 0xa9a15ab4, 0xa5fed6a9, 0xa2704302, 0x9ef5325f, 0x9b8d39b9,
-	0x9837f050, 0x94f4efa8, 0x91c3d373, 0x8ea4398a, 0x8b95c1e3, 0x88980e80,
-	0x85aac367, 0x82cd8698,
+	0xffffffff, 0xf5257d14, 0xeac0c6e6, 0xe0ccdeeb, 0xd744fcc9, 0xce248c14,
+	0xc5672a10, 0xbd08a39e, 0xb504f333, 0xad583ee9, 0xa5fed6a9, 0x9ef5325f,
+	0x9837f050, 0x91c3d373, 0x8b95c1e3, 0x85aac367, 0x80000000,
 };
 
 /*
@@ -2819,24 +2816,25 @@ static const u32 runnable_avg_yN_inv[] = {
  * over-estimates when re-combining.
  */
 static const u32 runnable_avg_yN_sum[] = {
-	    0, 1002, 1982, 2941, 3880, 4798, 5697, 6576, 7437, 8279, 9103,
-	 9909,10698,11470,12226,12966,13690,14398,15091,15769,16433,17082,
-	17718,18340,18949,19545,20128,20698,21256,21802,22336,22859,23371,
+	    0, 982, 1925, 2829, 3696, 4528, 5327, 6094, 6831, 7538, 8217,
+	 8905, 9565, 10218, 10844, 11444, 12024,
 };
 
 /*
- * Precomputed \Sum y^k { 1<=k<=n, where n%32=0). Values are rolled down to
- * lower integers. See Documentation/scheduler/sched-avg.txt how these
- * were generated:
+ * Precomputed \Sum y^k { 1<=k<=n, where n%16=0). Values are rolled down to
+ * lower integers.
  */
-static const u32 __accumulated_sum_N32[] = {
-	    0, 23371, 35056, 40899, 43820, 45281,
-	46011, 46376, 46559, 46650, 46696, 46719,
+static const u32 __accumulated_sum_N16[] = {
+	    0, 12024, 18036, 21042, 22545, 23296,
+	23672, 23860, 23934, 23981, 24004, 24016,
 };
+
+#define LOAD_AVG_PERIOD 16
+#define LOAD_AVG_MAX_N 176
 
 /*
  * Approximate:
- *   val * y^n,    where y^32 ~= 0.5 (~1 scheduling period)
+ *   val * y^n,    where y^16 ~= 0.5 (~1 scheduling period)
  */
 static __always_inline u64 decay_load(u64 val, u64 n)
 {
@@ -2880,10 +2878,10 @@ static u32 __compute_runnable_contrib(u64 n)
 	if (likely(n <= LOAD_AVG_PERIOD))
 		return runnable_avg_yN_sum[n];
 	else if (unlikely(n >= LOAD_AVG_MAX_N))
-		return LOAD_AVG_MAX;
+		return 47742; /* LOAD_AVG_MAX for 16ms */
 
 	/* Since n < LOAD_AVG_MAX_N, n/LOAD_AVG_PERIOD < 11 */
-	contrib = __accumulated_sum_N32[n/LOAD_AVG_PERIOD];
+	contrib = __accumulated_sum_N16[n/LOAD_AVG_PERIOD];
 	n %= LOAD_AVG_PERIOD;
 	contrib = decay_load(contrib, n);
 	return contrib + runnable_avg_yN_sum[n];
@@ -2907,10 +2905,10 @@ static u32 __compute_runnable_contrib(u64 n)
  * following representation of historical load:
  *   u_0 + u_1*y + u_2*y^2 + u_3*y^3 + ...
  *
- * We choose y based on the with of a reasonably scheduling period, fixing:
- *   y^32 = 0.5
+ * We choose y based on the width of a reasonably scheduling period, fixing:
+ *   y^16 = 0.5
  *
- * This means that the contribution to load ~32ms ago (u_32) will be weighted
+ * This means that the contribution to load ~16ms ago (u_16) will be weighted
  * approximately half as much as the contribution to load within the last ms
  * (u_0).
  *
