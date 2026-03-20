@@ -903,12 +903,11 @@ static int sugov_init(struct cpufreq_policy *policy)
 	}
 
 	/*
-	 * NOTE:
-	 * intializing up_rate/down_rate to 0 explicitly in kernel
-	 * since WALT expects so by default.
+	 * Mainline tuning: fast ramp up, conservative ramp down
+	 * to prevent micro-jank in UI.
 	 */
-	tunables->up_rate_limit_us = 0;
-	tunables->down_rate_limit_us = 0;
+	tunables->up_rate_limit_us = 500;
+	tunables->down_rate_limit_us = 20000;
 	tunables->hispeed_load = DEFAULT_HISPEED_LOAD;
 	tunables->hispeed_freq = 0;
 
