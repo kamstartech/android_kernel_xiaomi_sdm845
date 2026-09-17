@@ -2235,6 +2235,98 @@ SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
 }
 #endif
 
+#ifdef __ARCH_WANT_SYS_CLONE3
+static inline int clone3_args_valid(const struct clone_args *args)
+{
+	if (args->flags & (CLONE_DETACHED | CSIGNAL))
+		return -EINVAL;
+
+	if ((args->flags & (CLONE_THREAD | CLONE_PARENT)) && args->exit_signal)
+		return -EINVAL;
+
+	if (!valid_signal(args->exit_signal))
+		return -EINVAL;
+
+	if (args->stack == 0) {
+		if (args->stack_size != 0)
+			return -EINVAL;
+	} else {
+		if (args->stack_size == 0)
+			return -EINVAL;
+		if (!access_ok((void __user *)args->stack, args->stack_size))
+			return -EFAULT;
+	}
+
+	return 0;
+}
+
+SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)
+{
+	struct clone_args args;
+	unsigned long clone_flags;
+	int __user *parent_tidptr = NULL;
+	int __user *child_tidptr = NULL;
+	unsigned long stack;
+	unsigned long stack_size;
+	unsigned long tls = 0;
+	int ret;
+
+	if (size < sizeof(args))
+		return -EINVAL;
+	if (size > PAGE_SIZE)
+		return -E2BIG;
+
+	memset(&args, 0, sizeof(args));
+	if (copy_from_user(&args, uargs, sizeof(args)))
+		return -EFAULT;
+
+	/* Any extension fields must be zero. */
+	if (size > sizeof(args)) {
+		unsigned char __user *addr;
+		unsigned char __user *end;
+		unsigned char val;
+
+		addr = (void __user *)uargs + sizeof(args);
+		end = (void __user *)uargs + size;
+		for (; addr < end; addr++) {
+			if (get_user(val, addr))
+				return -EFAULT;
+			if (val)
+				return -E2BIG;
+		}
+	}
+
+	ret = clone3_args_valid(&args);
+	if (ret)
+		return ret;
+
+	clone_flags = args.flags | args.exit_signal;
+
+	if (args.flags & CLONE_PIDFD) {
+		if (args.flags & CLONE_PARENT_SETTID)
+			return -EINVAL;
+		parent_tidptr = u64_to_user_ptr(args.pidfd);
+	} else if (args.flags & CLONE_PARENT_SETTID) {
+		parent_tidptr = u64_to_user_ptr(args.parent_tid);
+	}
+
+	if (args.flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID))
+		child_tidptr = u64_to_user_ptr(args.child_tid);
+
+	stack = args.stack;
+	stack_size = args.stack_size;
+#if !defined(CONFIG_STACK_GROWSUP) && !defined(CONFIG_IA64)
+	stack += stack_size;
+#endif
+
+	if (args.flags & CLONE_SETTLS)
+		tls = args.tls;
+
+	return _do_fork(clone_flags, stack, stack_size, parent_tidptr,
+			child_tidptr, tls);
+}
+#endif /* __ARCH_WANT_SYS_CLONE3 */
+
 #ifndef ARCH_MIN_MMSTRUCT_ALIGN
 #define ARCH_MIN_MMSTRUCT_ALIGN 0
 #endif

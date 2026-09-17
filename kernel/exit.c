@@ -22,6 +22,7 @@
 #include <linux/freezer.h>
 #include <linux/binfmts.h>
 #include <linux/nsproxy.h>
+#include <linux/pid.h>
 #include <linux/pid_namespace.h>
 #include <linux/ptrace.h>
 #include <linux/profile.h>
@@ -1578,6 +1579,24 @@ end:
 	return retval;
 }
 
+static struct pid *pidfd_get_pid(unsigned int fd)
+{
+	struct fd f;
+	struct pid *pid;
+
+	f = fdget(fd);
+	if (!f.file)
+		return ERR_PTR(-EBADF);
+
+	if (f.file->f_op == &pidfd_fops)
+		pid = get_pid(f.file->private_data);
+	else
+		pid = ERR_PTR(-EBADF);
+
+	fdput(f);
+	return pid;
+}
+
 SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
 		infop, int, options, struct rusage __user *, ru)
 {
@@ -1606,11 +1625,19 @@ SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
 		if (upid <= 0)
 			return -EINVAL;
 		break;
+	case P_PIDFD:
+		type = PIDTYPE_PID;
+		if (upid < 0)
+			return -EINVAL;
+		pid = pidfd_get_pid(upid);
+		if (IS_ERR(pid))
+			return PTR_ERR(pid);
+		break;
 	default:
 		return -EINVAL;
 	}
 
-	if (type < PIDTYPE_MAX)
+	if (type < PIDTYPE_MAX && which != P_PIDFD)
 		pid = find_get_pid(upid);
 
 	wo.wo_type	= type;

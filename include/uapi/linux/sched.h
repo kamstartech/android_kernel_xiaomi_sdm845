@@ -31,6 +31,20 @@
 #define CLONE_IO		0x80000000	/* Clone io context */
 
 /*
+ * Arguments for the clone3 syscall
+ */
+struct clone_args {
+	__aligned_u64 flags;
+	__aligned_u64 pidfd;
+	__aligned_u64 child_tid;
+	__aligned_u64 parent_tid;
+	__aligned_u64 exit_signal;
+	__aligned_u64 stack;
+	__aligned_u64 stack_size;
+	__aligned_u64 tls;
+};
+
+/*
  * Scheduling policies
  */
 #define SCHED_NORMAL		0
