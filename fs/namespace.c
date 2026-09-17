@@ -25,6 +25,8 @@
 #include <linux/magic.h>
 #include <linux/bootmem.h>
 #include <linux/task_work.h>
+#include <linux/anon_inodes.h>
+#include <linux/fs_context.h>
 #include "pnode.h"
 #include "internal.h"
 
@@ -3596,3 +3598,367 @@ const struct proc_ns_operations mntns_operations = {
 	.install	= mntns_install,
 	.owner		= mntns_owner,
 };
+
+/*
+ * New mount API backport: fsopen/fsconfig/fsmount/move_mount/open_tree/fspick.
+ *
+ * This is a minimal implementation targeted at systemd's credential-setup
+ * path.  It uses the legacy vfs_kern_mount()/do_remount_sb2() machinery and
+ * keeps detached mounts as anon_inode file descriptors.
+ */
+
+static int fs_context_fops_release(struct inode *inode, struct file *file)
+{
+        fs_context_free(file->private_data);
+        return 0;
+}
+
+static const struct file_operations fs_context_fops = {
+        .release        = fs_context_fops_release,
+        .llseek         = no_llseek,
+};
+
+static int mount_fops_release(struct inode *inode, struct file *file)
+{
+        struct vfsmount *mnt = file->private_data;
+
+        if (mnt)
+                mntput(mnt);
+        return 0;
+}
+
+static const struct file_operations mount_fops = {
+        .release        = mount_fops_release,
+        .llseek         = no_llseek,
+};
+
+SYSCALL_DEFINE2(fsopen, const char __user *, fsname, unsigned int, flags)
+{
+        struct file_system_type *fs_type;
+        struct fs_context *fc;
+        char *kernel_fsname;
+        int fd;
+
+        if (flags & ~FSOPEN_CLOEXEC)
+                return -EINVAL;
+
+        kernel_fsname = copy_mount_string(fsname);
+        if (IS_ERR(kernel_fsname))
+                return PTR_ERR(kernel_fsname);
+
+        fs_type = get_fs_type(kernel_fsname);
+        kfree(kernel_fsname);
+        if (!fs_type)
+                return -ENODEV;
+
+        if (!may_mount()) {
+                put_filesystem(fs_type);
+                return -EPERM;
+        }
+
+        fc = fs_context_new(fs_type, flags);
+        if (IS_ERR(fc)) {
+                put_filesystem(fs_type);
+                return PTR_ERR(fc);
+        }
+
+        fd = anon_inode_getfd("fscontext", &fs_context_fops, fc,
+                              O_RDWR | (flags & FSOPEN_CLOEXEC ? O_CLOEXEC : 0));
+        if (fd < 0)
+                fs_context_free(fc);
+        return fd;
+}
+
+static struct fs_context *fs_context_from_fd(int fd, struct file **filep)
+{
+        struct file *file = fget(fd);
+        struct fs_context *fc;
+
+        if (!file)
+                return ERR_PTR(-EBADF);
+        if (file->f_op != &fs_context_fops) {
+                fput(file);
+                return ERR_PTR(-EINVAL);
+        }
+        fc = file->private_data;
+        *filep = file;
+        return fc;
+}
+
+SYSCALL_DEFINE5(fsconfig, int, fd, unsigned int, cmd, const char __user *, _key,
+                const void __user *, _value, int, aux)
+{
+        struct file *file;
+        struct fs_context *fc;
+        char *key = NULL, *value = NULL;
+        int ret;
+
+        switch (cmd) {
+        case FSCONFIG_SET_FLAG:
+        case FSCONFIG_SET_STRING:
+                if (!_key)
+                        return -EINVAL;
+                key = strndup_user(_key, 256);
+                if (IS_ERR(key))
+                        return PTR_ERR(key);
+                break;
+        }
+
+        switch (cmd) {
+        case FSCONFIG_SET_STRING:
+                if (aux)
+                        return -EINVAL;
+                if (!_value) {
+                        ret = -EINVAL;
+                        goto out;
+                }
+                value = strndup_user(_value, PAGE_SIZE);
+                if (IS_ERR(value)) {
+                        ret = PTR_ERR(value);
+                        value = NULL;
+                        goto out;
+                }
+                break;
+
+        case FSCONFIG_SET_FLAG:
+                if (aux)
+                        return -EINVAL;
+                break;
+
+        case FSCONFIG_CMD_CREATE:
+        case FSCONFIG_CMD_CREATE_EXCL:
+        case FSCONFIG_CMD_RECONFIGURE:
+                break;
+
+        default:
+                return -EINVAL;
+        }
+
+        switch (cmd) {
+        case FSCONFIG_SET_FLAG:
+                fc = fs_context_from_fd(fd, &file);
+                if (IS_ERR(fc)) {
+                        ret = PTR_ERR(fc);
+                        break;
+                }
+                ret = fs_context_set_flag(fc, key);
+                fput(file);
+                break;
+
+        case FSCONFIG_SET_STRING:
+                fc = fs_context_from_fd(fd, &file);
+                if (IS_ERR(fc)) {
+                        ret = PTR_ERR(fc);
+                        break;
+                }
+                ret = fs_context_set_string(fc, key, value);
+                fput(file);
+                break;
+
+        case FSCONFIG_CMD_CREATE:
+        case FSCONFIG_CMD_CREATE_EXCL:
+                fc = fs_context_from_fd(fd, &file);
+                if (IS_ERR(fc)) {
+                        ret = PTR_ERR(fc);
+                        break;
+                }
+                ret = fs_context_create(fc);
+                fput(file);
+                break;
+
+        case FSCONFIG_CMD_RECONFIGURE:
+                fc = fs_context_from_fd(fd, &file);
+                if (IS_ERR(fc)) {
+                        ret = PTR_ERR(fc);
+                        break;
+                }
+                ret = fs_context_reconfigure(fc);
+                fput(file);
+                break;
+
+        default:
+                ret = -EINVAL;
+        }
+
+out:
+        kfree(key);
+        kfree(value);
+        return ret;
+}
+
+SYSCALL_DEFINE3(fsmount, int, fd, unsigned int, flags, unsigned int, attr_flags)
+{
+        struct file *file;
+        struct fs_context *fc;
+        struct vfsmount *mnt;
+        int newfd, ret;
+
+        if (flags & ~FSMOUNT_CLOEXEC)
+                return -EINVAL;
+
+        fc = fs_context_from_fd(fd, &file);
+        if (IS_ERR(fc))
+                return PTR_ERR(fc);
+
+        ret = fs_context_apply_mount_attrs(fc, attr_flags);
+        if (ret) {
+                fput(file);
+                return ret;
+        }
+
+        if (!fc->root_mnt) {
+                fput(file);
+                return -EINVAL;
+        }
+        mnt = mntget(fc->root_mnt);
+        fput(file);
+
+        newfd = anon_inode_getfd("mount", &mount_fops, mnt,
+                                 O_RDWR | (flags & FSMOUNT_CLOEXEC ? O_CLOEXEC : 0));
+        if (newfd < 0)
+                mntput(mnt);
+        return newfd;
+}
+
+SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, path, unsigned int, flags)
+{
+        struct path p;
+        struct mount *mnt;
+        int lookup_flags = 0;
+        int error;
+        int fd;
+
+        if (flags & ~(OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_SYMLINK_NOFOLLOW |
+                      AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_EMPTY_PATH))
+                return -EINVAL;
+        if (!(flags & OPEN_TREE_CLONE))
+                return -EINVAL;
+
+        if (!(flags & AT_SYMLINK_NOFOLLOW))
+                lookup_flags |= LOOKUP_FOLLOW;
+        if (flags & AT_EMPTY_PATH)
+                lookup_flags |= LOOKUP_EMPTY;
+
+        error = user_path_at(dfd, path, lookup_flags, &p);
+        if (error)
+                return error;
+
+        if (!may_mount()) {
+                path_put(&p);
+                return -EPERM;
+        }
+
+        namespace_lock();
+        if (!check_mnt(real_mount(p.mnt))) {
+                namespace_unlock();
+                path_put(&p);
+                return -EINVAL;
+        }
+
+        if (flags & AT_RECURSIVE)
+                mnt = copy_tree(real_mount(p.mnt), p.dentry,
+                                CL_COPY_ALL | CL_PRIVATE);
+        else
+                mnt = clone_mnt(real_mount(p.mnt), p.dentry, CL_PRIVATE);
+        namespace_unlock();
+        path_put(&p);
+        if (IS_ERR(mnt))
+                return PTR_ERR(mnt);
+
+        fd = anon_inode_getfd("mount", &mount_fops, mnt,
+                              O_RDWR | (flags & OPEN_TREE_CLOEXEC ? O_CLOEXEC : 0));
+        if (fd < 0) {
+                mntput(&mnt->mnt);
+                return fd;
+        }
+        return fd;
+}
+
+static struct mount *mount_from_fd(int fd, struct file **filep)
+{
+        struct file *file = fget(fd);
+        struct mount *mnt;
+
+        if (!file)
+                return ERR_PTR(-EBADF);
+        if (file->f_op != &mount_fops) {
+                fput(file);
+                return ERR_PTR(-EINVAL);
+        }
+        mnt = file->private_data;
+        *filep = file;
+        return mnt;
+}
+
+SYSCALL_DEFINE5(move_mount, int, from_dfd, const char __user *, from_path,
+                int, to_dfd, const char __user *, to_path,
+                unsigned int, flags)
+{
+        struct file *file;
+        struct mount *source_mnt;
+        struct path p;
+        struct mountpoint *mp;
+        int lookup_flags = 0;
+        int ret;
+
+        if (flags & ~(MOVE_MOUNT_F_SYMLINKS | MOVE_MOUNT_F_AUTOMOUNTS |
+                      MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS |
+                      MOVE_MOUNT_T_AUTOMOUNTS | MOVE_MOUNT_T_EMPTY_PATH |
+                      MOVE_MOUNT_BENEATH))
+                return -EINVAL;
+        if (flags & MOVE_MOUNT_BENEATH)
+                return -EINVAL; /* not supported; caller must fall back */
+        if (!(flags & MOVE_MOUNT_F_EMPTY_PATH))
+                return -EINVAL; /* only detached mount-fd sources are handled */
+
+        source_mnt = mount_from_fd(from_dfd, &file);
+        if (IS_ERR(source_mnt))
+                return PTR_ERR(source_mnt);
+
+        /* Once attached, a mount fd cannot be moved again. */
+        if (mnt_has_parent(source_mnt)) {
+                fput(file);
+                return -EBUSY;
+        }
+        fput(file);
+
+        if (to_dfd == -EBADF)
+                to_dfd = AT_FDCWD;
+
+        if (flags & MOVE_MOUNT_T_SYMLINKS)
+                lookup_flags |= LOOKUP_FOLLOW;
+        if (flags & MOVE_MOUNT_T_EMPTY_PATH)
+                lookup_flags |= LOOKUP_EMPTY;
+
+        ret = user_path_at(to_dfd, to_path, lookup_flags, &p);
+        if (ret)
+                return ret;
+
+        if (!may_mount()) {
+                path_put(&p);
+                return -EPERM;
+        }
+
+        mp = lock_mount(&p);
+        ret = PTR_ERR(mp);
+        if (IS_ERR(mp))
+                goto out;
+
+        ret = -EINVAL;
+        if (!check_mnt(real_mount(p.mnt)))
+                goto out_unlock;
+        if (d_is_dir(p.dentry) != d_is_dir(source_mnt->mnt.mnt_root))
+                goto out_unlock;
+
+        ret = attach_recursive_mnt(source_mnt, real_mount(p.mnt), mp, NULL);
+out_unlock:
+        unlock_mount(mp);
+out:
+        path_put(&p);
+        return ret;
+}
+
+SYSCALL_DEFINE3(fspick, int, dfd, const char __user *, path, unsigned int, flags)
+{
+        return -ENOSYS;
+}
