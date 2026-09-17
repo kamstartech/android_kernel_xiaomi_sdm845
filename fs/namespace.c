@@ -3831,7 +3831,12 @@ SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, path, unsigned int, fl
         if (flags & ~(OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_SYMLINK_NOFOLLOW |
                       AT_NO_AUTOMOUNT | AT_RECURSIVE | AT_EMPTY_PATH))
                 return -EINVAL;
-        if (!(flags & OPEN_TREE_CLONE))
+        /*
+         * AT_RECURSIVE only means something when cloning a subtree; without
+         * OPEN_TREE_CLONE this is a plain path open (see below) and a bare
+         * recursive flag on that is meaningless.
+         */
+        if ((flags & (AT_RECURSIVE | OPEN_TREE_CLONE)) == AT_RECURSIVE)
                 return -EINVAL;
 
         if (!(flags & AT_SYMLINK_NOFOLLOW))
@@ -3842,6 +3847,36 @@ SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, path, unsigned int, fl
         error = user_path_at(dfd, path, lookup_flags, &p);
         if (error)
                 return error;
+
+        /*
+         * Without OPEN_TREE_CLONE, open_tree() is just open(path, O_PATH)
+         * under a different name -- upstream semantics this backport
+         * originally got wrong by unconditionally requiring CLONE.
+         * Confirmed live 2026-09-17 via strace that systemd's
+         * PrivateDevices=/mount-rootfs namespace setup calls it exactly
+         * this way (open_tree(dfd, "dev", OPEN_TREE_CLOEXEC|
+         * AT_SYMLINK_NOFOLLOW), no CLONE) to get a plain fd handle before
+         * move_mount()-ing it elsewhere; the old blanket -EINVAL here is
+         * what was actually behind systemd-logind.service's
+         * EXIT_NAMESPACE crash-loop, not a missing mount_setattr().
+         */
+        if (!(flags & OPEN_TREE_CLONE)) {
+                struct file *file;
+
+                fd = get_unused_fd_flags(flags & OPEN_TREE_CLOEXEC ? O_CLOEXEC : 0);
+                if (fd < 0) {
+                        path_put(&p);
+                        return fd;
+                }
+                file = dentry_open(&p, O_PATH, current_cred());
+                path_put(&p);
+                if (IS_ERR(file)) {
+                        put_unused_fd(fd);
+                        return PTR_ERR(file);
+                }
+                fd_install(fd, file);
+                return fd;
+        }
 
         if (!may_mount()) {
                 path_put(&p);
