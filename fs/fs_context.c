@@ -13,6 +13,14 @@
 #include <linux/string.h>
 #include <linux/capability.h>
 #include <linux/mnt_namespace.h>
+/*
+ * <linux/mnt_namespace.h> only forward-declares struct mnt_namespace --
+ * the real definition (needed below for current->nsproxy->mnt_ns->user_ns)
+ * is kept private to fs/, in fs/mount.h. fs/namespace.c already pulls this
+ * in transitively via "pnode.h"; do the same here rather than reaching for
+ * fs/mount.h directly, to match the rest of this directory's convention.
+ */
+#include "pnode.h"
 #include <linux/user_namespace.h>
 #include <linux/seqlock.h>
 #include <uapi/linux/mount.h>
