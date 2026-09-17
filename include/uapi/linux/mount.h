@@ -33,7 +33,17 @@ enum fsconfig_command {
  * open_tree() flags.
  */
 #define OPEN_TREE_CLONE         0x01    /* Clone the target tree */
-#define OPEN_TREE_CLOEXEC       0x02    /* Close the file descriptor on exec */
+/*
+ * O_CLOEXEC (0x80000 on this arch), not a small sequential bit -- matches
+ * upstream exactly, which defines this as O_CLOEXEC so the flag can be
+ * passed straight through to get_unused_fd_flags()/anon_inode_getfd().
+ * The original backport hardcoded 0x02 here, which silently rejected
+ * every real caller (glibc/systemd always pass the real O_CLOEXEC value)
+ * with -EINVAL from open_tree()'s own flag-validation mask -- root-caused
+ * live 2026-09-17 via a raw (undecoded) strace showing callers actually
+ * passing 0x80100, not the 0x102 this kernel's stale mask expected.
+ */
+#define OPEN_TREE_CLOEXEC       O_CLOEXEC
 
 /*
  * move_mount() flags.
