@@ -16,16 +16,22 @@
 #include <linux/atomic.h>
 #include <linux/audit.h>
 #include <linux/compat.h>
+#include <linux/coredump.h>
+#include <linux/kmemleak.h>
 #include <linux/nospec.h>
 #include <linux/prctl.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
+#include <linux/sysctl.h>
 
 #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
 #include <asm/syscall.h>
 #endif
+
+/* Not exposed in headers: strictly internal use only. */
+#define SECCOMP_MODE_DEAD	(SECCOMP_MODE_FILTER + 1)
 
 #ifdef CONFIG_SECCOMP_FILTER
 #include <linux/filter.h>
@@ -58,6 +64,7 @@
  */
 struct seccomp_filter {
 	atomic_t usage;
+	bool log;
 	struct seccomp_filter *prev;
 	struct bpf_prog *prog;
 };
@@ -171,11 +178,16 @@ static int seccomp_check_filter(struct sock_filter *filter, unsigned int flen)
 
 /**
  * seccomp_run_filters - evaluates all seccomp filters against @syscall
- * @syscall: number of the current system call
+ * @sd: optional seccomp data to be passed to filters
+ * @match: stores struct seccomp_filter that resulted in the return value,
+ *         unless filter returned SECCOMP_RET_ALLOW, in which case it will
+ *         be unchanged.
  *
  * Returns valid seccomp BPF response codes.
  */
-static u32 seccomp_run_filters(const struct seccomp_data *sd)
+#define ACTION_ONLY(ret) ((s32)((ret) & (SECCOMP_RET_ACTION_FULL)))
+static u32 seccomp_run_filters(const struct seccomp_data *sd,
+			       struct seccomp_filter **match)
 {
 	struct seccomp_data sd_local;
 	u32 ret = SECCOMP_RET_ALLOW;
@@ -185,7 +197,7 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd)
 
 	/* Ensure unexpected behavior doesn't result in failing open. */
 	if (unlikely(WARN_ON(f == NULL)))
-		return SECCOMP_RET_KILL;
+		return SECCOMP_RET_KILL_PROCESS;
 
 	if (!sd) {
 		populate_seccomp_data(&sd_local);
@@ -199,8 +211,10 @@ static u32 seccomp_run_filters(const struct seccomp_data *sd)
 	for (; f; f = f->prev) {
 		u32 cur_ret = BPF_PROG_RUN(f->prog, (void *)sd);
 
-		if ((cur_ret & SECCOMP_RET_ACTION) < (ret & SECCOMP_RET_ACTION))
+		if (ACTION_ONLY(cur_ret) < ACTION_ONLY(ret)) {
 			ret = cur_ret;
+			*match = f;
+		}
 	}
 	return ret;
 }
@@ -452,6 +466,8 @@ static long seccomp_attach_filter(unsigned int flags,
 			return ret;
 	}
 
+	filter->log = flags & SECCOMP_FILTER_FLAG_LOG;
+
 	/*
 	 * If there is an existing filter, make it the prev and don't drop its
 	 * task reference.
@@ -505,6 +521,17 @@ void put_seccomp_filter(struct task_struct *tsk)
 	__put_seccomp_filter(tsk->seccomp.filter);
 }
 
+static void seccomp_init_siginfo(struct siginfo *info, int syscall, int reason)
+{
+	memset(info, 0, sizeof(*info));
+	info->si_signo = SIGSYS;
+	info->si_code = SYS_SECCOMP;
+	info->si_call_addr = (void __user *)KSTK_EIP(current);
+	info->si_errno = reason;
+	info->si_arch = syscall_get_arch();
+	info->si_syscall = syscall;
+}
+
 /**
  * seccomp_send_sigsys - signals the task to allow in-process syscall emulation
  * @syscall: syscall number to send to userland
@@ -515,16 +542,69 @@ void put_seccomp_filter(struct task_struct *tsk)
 static void seccomp_send_sigsys(int syscall, int reason)
 {
 	struct siginfo info;
-	memset(&info, 0, sizeof(info));
-	info.si_signo = SIGSYS;
-	info.si_code = SYS_SECCOMP;
-	info.si_call_addr = (void __user *)KSTK_EIP(current);
-	info.si_errno = reason;
-	info.si_arch = syscall_get_arch();
-	info.si_syscall = syscall;
+	seccomp_init_siginfo(&info, syscall, reason);
 	force_sig_info(SIGSYS, &info, current);
 }
 #endif	/* CONFIG_SECCOMP_FILTER */
+
+/* For use with seccomp_actions_logged */
+#define SECCOMP_LOG_KILL_PROCESS	(1 << 0)
+#define SECCOMP_LOG_KILL_THREAD		(1 << 1)
+#define SECCOMP_LOG_TRAP		(1 << 2)
+#define SECCOMP_LOG_ERRNO		(1 << 3)
+#define SECCOMP_LOG_TRACE		(1 << 4)
+#define SECCOMP_LOG_LOG			(1 << 5)
+#define SECCOMP_LOG_ALLOW		(1 << 6)
+
+static u32 seccomp_actions_logged = SECCOMP_LOG_KILL_PROCESS |
+				    SECCOMP_LOG_KILL_THREAD  |
+				    SECCOMP_LOG_TRAP  |
+				    SECCOMP_LOG_ERRNO |
+				    SECCOMP_LOG_TRACE |
+				    SECCOMP_LOG_LOG;
+
+static inline void seccomp_log(unsigned long syscall, long signr, u32 action,
+			       bool requested)
+{
+	bool log = false;
+
+	switch (action) {
+	case SECCOMP_RET_ALLOW:
+		break;
+	case SECCOMP_RET_TRAP:
+		log = requested && seccomp_actions_logged & SECCOMP_LOG_TRAP;
+		break;
+	case SECCOMP_RET_ERRNO:
+		log = requested && seccomp_actions_logged & SECCOMP_LOG_ERRNO;
+		break;
+	case SECCOMP_RET_TRACE:
+		log = requested && seccomp_actions_logged & SECCOMP_LOG_TRACE;
+		break;
+	case SECCOMP_RET_LOG:
+		log = seccomp_actions_logged & SECCOMP_LOG_LOG;
+		break;
+	case SECCOMP_RET_KILL_THREAD:
+		log = seccomp_actions_logged & SECCOMP_LOG_KILL_THREAD;
+		break;
+	case SECCOMP_RET_KILL_PROCESS:
+	default:
+		log = seccomp_actions_logged & SECCOMP_LOG_KILL_PROCESS;
+	}
+
+	/*
+	 * Force an audit message to be emitted when the action is RET_KILL_*,
+	 * RET_LOG, or the FILTER_FLAG_LOG bit was set and the action is
+	 * allowed to be logged by the admin.
+	 */
+	if (log)
+		return __audit_seccomp(syscall, signr, action);
+
+	/*
+	 * Let the audit subsystem decide if the action should be audited based
+	 * on whether the current task itself is being audited.
+	 */
+	return audit_seccomp(syscall, signr, action);
+}
 
 /*
  * Secure computing mode 1 allows only read/write/exit/sigreturn.
@@ -551,7 +631,8 @@ static void __secure_computing_strict(int this_syscall)
 #ifdef SECCOMP_DEBUG
 	dump_stack();
 #endif
-	audit_seccomp(this_syscall, SIGKILL, SECCOMP_RET_KILL);
+	current->seccomp.mode = SECCOMP_MODE_DEAD;
+	seccomp_log(this_syscall, SIGKILL, SECCOMP_RET_KILL_THREAD, true);
 	do_exit(SIGKILL);
 }
 
@@ -578,6 +659,7 @@ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
 			    const bool recheck_after_trace)
 {
 	u32 filter_ret, action;
+	struct seccomp_filter *match = NULL;
 	int data;
 
 	/*
@@ -586,9 +668,9 @@ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
 	 */
 	rmb();
 
-	filter_ret = seccomp_run_filters(sd);
+	filter_ret = seccomp_run_filters(sd, &match);
 	data = filter_ret & SECCOMP_RET_DATA;
-	action = filter_ret & SECCOMP_RET_ACTION;
+	action = filter_ret & SECCOMP_RET_ACTION_FULL;
 
 	switch (action) {
 	case SECCOMP_RET_ERRNO:
@@ -649,19 +731,44 @@ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
 
 		return 0;
 
-	case SECCOMP_RET_ALLOW:
+	case SECCOMP_RET_LOG:
+		seccomp_log(this_syscall, 0, action, true);
 		return 0;
 
-	case SECCOMP_RET_KILL:
+	case SECCOMP_RET_ALLOW:
+		/*
+		 * Note that the "match" filter will always be NULL for
+		 * this action since SECCOMP_RET_ALLOW is the starting
+		 * state in seccomp_run_filters().
+		 */
+		return 0;
+
+	case SECCOMP_RET_KILL_THREAD:
+	case SECCOMP_RET_KILL_PROCESS:
 	default:
-		audit_seccomp(this_syscall, SIGSYS, action);
-		do_exit(SIGSYS);
+		current->seccomp.mode = SECCOMP_MODE_DEAD;
+		seccomp_log(this_syscall, SIGSYS, action, true);
+		/* Dump core only if this is the last remaining thread. */
+		if (action == SECCOMP_RET_KILL_PROCESS ||
+		    get_nr_threads(current) == 1) {
+			struct siginfo info;
+
+			/* Show the original registers in the dump. */
+			syscall_rollback(current, task_pt_regs(current));
+			/* Trigger a manual coredump since do_exit skips it. */
+			seccomp_init_siginfo(&info, this_syscall, data);
+			do_coredump(&info);
+		}
+		if (action == SECCOMP_RET_KILL_PROCESS)
+			do_group_exit(SIGSYS);
+		else
+			do_exit(SIGSYS);
 	}
 
 	unreachable();
 
 skip:
-	audit_seccomp(this_syscall, 0, action);
+	seccomp_log(this_syscall, 0, action, match ? match->log : false);
 	return -1;
 }
 #else
@@ -692,6 +799,11 @@ int __secure_computing(const struct seccomp_data *sd)
 		return 0;
 	case SECCOMP_MODE_FILTER:
 		return __seccomp_filter(this_syscall, sd, false);
+	/* Surviving SECCOMP_RET_KILL_* must be proactively impossible. */
+	case SECCOMP_MODE_DEAD:
+		WARN_ON_ONCE(1);
+		do_exit(SIGKILL);
+		return -1;
 	default:
 		BUG();
 	}
@@ -798,6 +910,29 @@ static inline long seccomp_set_mode_filter(unsigned int flags,
 }
 #endif
 
+static long seccomp_get_action_avail(const char __user *uaction)
+{
+	u32 action;
+
+	if (copy_from_user(&action, uaction, sizeof(action)))
+		return -EFAULT;
+
+	switch (action) {
+	case SECCOMP_RET_KILL_PROCESS:
+	case SECCOMP_RET_KILL_THREAD:
+	case SECCOMP_RET_TRAP:
+	case SECCOMP_RET_ERRNO:
+	case SECCOMP_RET_TRACE:
+	case SECCOMP_RET_LOG:
+	case SECCOMP_RET_ALLOW:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
 /* Common entry point for both prctl and syscall. */
 static long do_seccomp(unsigned int op, unsigned int flags,
 		       const char __user *uargs)
@@ -809,6 +944,11 @@ static long do_seccomp(unsigned int op, unsigned int flags,
 		return seccomp_set_mode_strict();
 	case SECCOMP_SET_MODE_FILTER:
 		return seccomp_set_mode_filter(flags, uargs);
+	case SECCOMP_GET_ACTION_AVAIL:
+		if (flags != 0)
+			return -EINVAL;
+
+		return seccomp_get_action_avail(uargs);
 	default:
 		return -EINVAL;
 	}
@@ -926,3 +1066,185 @@ out:
 	return ret;
 }
 #endif
+
+#ifdef CONFIG_SYSCTL
+
+/* Human readable action names for friendly sysctl interaction */
+#define SECCOMP_RET_KILL_PROCESS_NAME	"kill_process"
+#define SECCOMP_RET_KILL_THREAD_NAME	"kill_thread"
+#define SECCOMP_RET_TRAP_NAME		"trap"
+#define SECCOMP_RET_ERRNO_NAME		"errno"
+#define SECCOMP_RET_TRACE_NAME		"trace"
+#define SECCOMP_RET_LOG_NAME		"log"
+#define SECCOMP_RET_ALLOW_NAME		"allow"
+
+static const char seccomp_actions_avail[] =
+				SECCOMP_RET_KILL_PROCESS_NAME	" "
+				SECCOMP_RET_KILL_THREAD_NAME	" "
+				SECCOMP_RET_TRAP_NAME		" "
+				SECCOMP_RET_ERRNO_NAME		" "
+				SECCOMP_RET_TRACE_NAME		" "
+				SECCOMP_RET_LOG_NAME		" "
+				SECCOMP_RET_ALLOW_NAME;
+
+struct seccomp_log_name {
+	u32		log;
+	const char	*name;
+};
+
+static const struct seccomp_log_name seccomp_log_names[] = {
+	{ SECCOMP_LOG_KILL_PROCESS, SECCOMP_RET_KILL_PROCESS_NAME },
+	{ SECCOMP_LOG_KILL_THREAD, SECCOMP_RET_KILL_THREAD_NAME },
+	{ SECCOMP_LOG_TRAP, SECCOMP_RET_TRAP_NAME },
+	{ SECCOMP_LOG_ERRNO, SECCOMP_RET_ERRNO_NAME },
+	{ SECCOMP_LOG_TRACE, SECCOMP_RET_TRACE_NAME },
+	{ SECCOMP_LOG_LOG, SECCOMP_RET_LOG_NAME },
+	{ SECCOMP_LOG_ALLOW, SECCOMP_RET_ALLOW_NAME },
+	{ }
+};
+
+static bool seccomp_names_from_actions_logged(char *names, size_t size,
+					      u32 actions_logged)
+{
+	const struct seccomp_log_name *cur;
+	bool append_space = false;
+
+	for (cur = seccomp_log_names; cur->name && size; cur++) {
+		ssize_t ret;
+
+		if (!(actions_logged & cur->log))
+			continue;
+
+		if (append_space) {
+			ret = strscpy(names, " ", size);
+			if (ret < 0)
+				return false;
+
+			names += ret;
+			size -= ret;
+		} else
+			append_space = true;
+
+		ret = strscpy(names, cur->name, size);
+		if (ret < 0)
+			return false;
+
+		names += ret;
+		size -= ret;
+	}
+
+	return true;
+}
+
+static bool seccomp_action_logged_from_name(u32 *action_logged,
+					    const char *name)
+{
+	const struct seccomp_log_name *cur;
+
+	for (cur = seccomp_log_names; cur->name; cur++) {
+		if (!strcmp(cur->name, name)) {
+			*action_logged = cur->log;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool seccomp_actions_logged_from_names(u32 *actions_logged, char *names)
+{
+	char *name;
+
+	*actions_logged = 0;
+	while ((name = strsep(&names, " ")) && *name) {
+		u32 action_logged = 0;
+
+		if (!seccomp_action_logged_from_name(&action_logged, name))
+			return false;
+
+		*actions_logged |= action_logged;
+	}
+
+	return true;
+}
+
+static int seccomp_actions_logged_handler(struct ctl_table *ro_table, int write,
+					  void __user *buffer, size_t *lenp,
+					  loff_t *ppos)
+{
+	char names[sizeof(seccomp_actions_avail)];
+	struct ctl_table table;
+	int ret;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	memset(names, 0, sizeof(names));
+
+	if (!write) {
+		if (!seccomp_names_from_actions_logged(names, sizeof(names),
+						       seccomp_actions_logged))
+			return -EINVAL;
+	}
+
+	table = *ro_table;
+	table.data = names;
+	table.maxlen = sizeof(names);
+	ret = proc_dostring(&table, write, buffer, lenp, ppos);
+	if (ret)
+		return ret;
+
+	if (write) {
+		u32 actions_logged;
+
+		if (!seccomp_actions_logged_from_names(&actions_logged,
+						       table.data))
+			return -EINVAL;
+
+		if (actions_logged & SECCOMP_LOG_ALLOW)
+			return -EINVAL;
+
+		seccomp_actions_logged = actions_logged;
+	}
+
+	return 0;
+}
+
+static struct ctl_path seccomp_sysctl_path[] = {
+	{ .procname = "kernel", },
+	{ .procname = "seccomp", },
+	{ }
+};
+
+static struct ctl_table seccomp_sysctl_table[] = {
+	{
+		.procname	= "actions_avail",
+		.data		= (void *) &seccomp_actions_avail,
+		.maxlen		= sizeof(seccomp_actions_avail),
+		.mode		= 0444,
+		.proc_handler	= proc_dostring,
+	},
+	{
+		.procname	= "actions_logged",
+		.mode		= 0644,
+		.proc_handler	= seccomp_actions_logged_handler,
+	},
+	{ }
+};
+
+static int __init seccomp_sysctl_init(void)
+{
+	struct ctl_table_header *hdr;
+
+	hdr = register_sysctl_paths(seccomp_sysctl_path, seccomp_sysctl_table);
+	if (!hdr)
+		pr_warn("seccomp: sysctl registration failed\n");
+	else
+		kmemleak_not_leak(hdr);
+
+	return 0;
+}
+
+device_initcall(seccomp_sysctl_init)
+
+#endif /* CONFIG_SYSCTL */
