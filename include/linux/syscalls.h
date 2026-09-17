@@ -418,6 +418,7 @@ asmlinkage long sys_fsconfig(int fd, unsigned int cmd, const char __user *key,
                              const void __user *value, int aux);
 asmlinkage long sys_fsmount(int fd, unsigned int flags, unsigned int attr_flags);
 asmlinkage long sys_fspick(int dfd, const char __user *path, unsigned int flags);
+struct mount_attr;
 asmlinkage long sys_mount_setattr(int dfd, const char __user *path,
 				   unsigned int flags,
 				   struct mount_attr __user *uattr, size_t usize);
