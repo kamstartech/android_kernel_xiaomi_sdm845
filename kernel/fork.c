@@ -2253,7 +2253,7 @@ static inline int clone3_args_valid(const struct clone_args *args)
 	} else {
 		if (args->stack_size == 0)
 			return -EINVAL;
-		if (!access_ok((void __user *)args->stack, args->stack_size))
+		if (!access_ok(VERIFY_WRITE, (void __user *)args->stack, args->stack_size))
 			return -EFAULT;
 	}
 
