@@ -3962,3 +3962,182 @@ SYSCALL_DEFINE3(fspick, int, dfd, const char __user *, path, unsigned int, flags
 {
         return -ENOSYS;
 }
+
+/*
+ * mount_setattr(2) -- minimal backport (Kaos).
+ *
+ * Upstream's real mount_setattr() also handles mount propagation changes
+ * (uattr->propagation) and idmapped mounts (uattr->userns_fd), both driven
+ * by mnt_hold_writers()/mnt_idmap infrastructure this kernel doesn't carry.
+ * Neither is exercised by this target: systemd's hardened units
+ * (ProtectSystem=strict, ProtectHome=, PrivateTmp=, etc -- confirmed live
+ * 2026-09-17 that systemd-logind.service fails to start at all with
+ * ExecMainStatus=226/EXIT_NAMESPACE once RestrictNamespaces=yes together
+ * with those directives forces src/core/namespace.c onto the
+ * mount_setattr() path instead of the old bind+MS_REMOUNT dance the
+ * open_tree()/move_mount() backport above didn't touch) only ever call
+ * this to apply MOUNT_ATTR_RDONLY/NOSUID/NODEV/NOEXEC/atime bits to mounts
+ * it already built with open_tree()/move_mount(), optionally recursively
+ * via AT_RECURSIVE. That's exactly what this implements, by reusing the
+ * same mnt_make_readonly()/lock_mount_hash() primitives do_remount()'s own
+ * MS_BIND path already uses for mount-local (not superblock-level) flag
+ * changes just above -- so a request for propagation changes or idmapped
+ * mounts is rejected with -EINVAL rather than silently ignored, and only
+ * the exact V0 struct mount_attr size is accepted (no copy_struct_from_user
+ * here -- this kernel predates it -- so a future larger struct from a
+ * newer glibc fails closed with -EINVAL instead of being silently
+ * truncated).
+ */
+
+#define MOUNT_SETATTR_VALID_ATTRS \
+        (MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | \
+         MOUNT_ATTR_NOEXEC | MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME)
+
+static int mount_setattr_attr_to_mnt_flags(u64 attr_set, u64 attr_clr,
+                                            unsigned int *set, unsigned int *clr)
+{
+        u64 atime;
+
+        if ((attr_set | attr_clr) & ~MOUNT_SETATTR_VALID_ATTRS)
+                return -EINVAL;
+        /* atime is a tri-state selector, not an independent clearable bit */
+        if (attr_clr & MOUNT_ATTR__ATIME)
+                return -EINVAL;
+
+        if (attr_set & MOUNT_ATTR_RDONLY)
+                *set |= MNT_READONLY;
+        if (attr_clr & MOUNT_ATTR_RDONLY)
+                *clr |= MNT_READONLY;
+
+        if (attr_set & MOUNT_ATTR_NOSUID)
+                *set |= MNT_NOSUID;
+        if (attr_clr & MOUNT_ATTR_NOSUID)
+                *clr |= MNT_NOSUID;
+
+        if (attr_set & MOUNT_ATTR_NODEV)
+                *set |= MNT_NODEV;
+        if (attr_clr & MOUNT_ATTR_NODEV)
+                *clr |= MNT_NODEV;
+
+        if (attr_set & MOUNT_ATTR_NOEXEC)
+                *set |= MNT_NOEXEC;
+        if (attr_clr & MOUNT_ATTR_NOEXEC)
+                *clr |= MNT_NOEXEC;
+
+        if (attr_set & MOUNT_ATTR_NODIRATIME)
+                *set |= MNT_NODIRATIME;
+        if (attr_clr & MOUNT_ATTR_NODIRATIME)
+                *clr |= MNT_NODIRATIME;
+
+        atime = attr_set & MOUNT_ATTR__ATIME;
+        if (atime == MOUNT_ATTR_NOATIME) {
+                *set |= MNT_NOATIME;
+                *clr |= MNT_RELATIME;
+        } else if (atime == MOUNT_ATTR_STRICTATIME) {
+                *clr |= MNT_NOATIME | MNT_RELATIME;
+        } else if (atime != MOUNT_ATTR_RELATIME) {
+                /* stray bit combination inside the tri-state atime field */
+                return -EINVAL;
+        }
+
+        return 0;
+}
+
+static int do_mount_setattr_one(struct mount *m, unsigned int set,
+                                 unsigned int clr)
+{
+        int err;
+
+        if ((m->mnt.mnt_flags & MNT_LOCK_READONLY) && (clr & MNT_READONLY))
+                return -EPERM;
+        if ((m->mnt.mnt_flags & MNT_LOCK_NOSUID) && (clr & MNT_NOSUID))
+                return -EPERM;
+        if ((m->mnt.mnt_flags & MNT_LOCK_NODEV) && (clr & MNT_NODEV))
+                return -EPERM;
+        if ((m->mnt.mnt_flags & MNT_LOCK_NOEXEC) && (clr & MNT_NOEXEC))
+                return -EPERM;
+        if ((m->mnt.mnt_flags & MNT_LOCK_ATIME) && ((set | clr) & MNT_ATIME_MASK))
+                return -EPERM;
+
+        if (set & MNT_READONLY) {
+                err = mnt_make_readonly(m);
+                if (err)
+                        return err;
+        } else if (clr & MNT_READONLY) {
+                __mnt_unmake_readonly(m);
+        }
+
+        lock_mount_hash();
+        m->mnt.mnt_flags = (m->mnt.mnt_flags & ~(clr & ~MNT_READONLY)) |
+                            (set & ~MNT_READONLY);
+        touch_mnt_namespace(m->mnt_ns);
+        unlock_mount_hash();
+        return 0;
+}
+
+SYSCALL_DEFINE5(mount_setattr, int, dfd, const char __user *, path,
+                unsigned int, flags, struct mount_attr __user *, uattr,
+                size_t, usize)
+{
+        int err;
+        int lookup_flags = 0;
+        struct mount_attr attr;
+        struct path target;
+        unsigned int set = 0, clr = 0;
+
+        if (flags & ~(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW |
+                      AT_NO_AUTOMOUNT))
+                return -EINVAL;
+
+        if (usize != sizeof(attr))
+                return -EINVAL;
+        if (copy_from_user(&attr, uattr, sizeof(attr)))
+                return -EFAULT;
+
+        if (attr.propagation)
+                return -EINVAL;
+        if (attr.userns_fd)
+                return -EINVAL;
+
+        err = mount_setattr_attr_to_mnt_flags(attr.attr_set, attr.attr_clr,
+                                               &set, &clr);
+        if (err)
+                return err;
+
+        if (!(flags & AT_SYMLINK_NOFOLLOW))
+                lookup_flags |= LOOKUP_FOLLOW;
+        if (flags & AT_EMPTY_PATH)
+                lookup_flags |= LOOKUP_EMPTY;
+
+        err = user_path_at(dfd, path, lookup_flags, &target);
+        if (err)
+                return err;
+
+        if (!may_mount()) {
+                path_put(&target);
+                return -EPERM;
+        }
+
+        namespace_lock();
+        if (!check_mnt(real_mount(target.mnt))) {
+                namespace_unlock();
+                path_put(&target);
+                return -EINVAL;
+        }
+
+        if (flags & AT_RECURSIVE) {
+                struct mount *root = real_mount(target.mnt);
+                struct mount *m;
+
+                for (m = root; m; m = next_mnt(m, root)) {
+                        err = do_mount_setattr_one(m, set, clr);
+                        if (err)
+                                break;
+                }
+        } else {
+                err = do_mount_setattr_one(real_mount(target.mnt), set, clr);
+        }
+        namespace_unlock();
+        path_put(&target);
+        return err;
+}

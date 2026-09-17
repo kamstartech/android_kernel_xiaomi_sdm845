@@ -751,8 +751,20 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
 #define __NR_clone3 435
 __SYSCALL(__NR_clone3, sys_clone3)
 
+/*
+ * 436-441 are intentionally left unused here (openat2, pidfd_getfd,
+ * faccessat2, watch_mount, watch_sb and fsinfo/quotactl_fd on some arches
+ * upstream) -- this backport only adds the one new-mount-API syscall the
+ * hardened systemd units (ProtectSystem=strict et al) actually invoke to
+ * apply MOUNT_ATTR_* flags after open_tree()/move_mount(), so
+ * __NR_mount_setattr keeps its real upstream number (442) rather than
+ * being renumbered down, in case a later backport fills the gap.
+ */
+#define __NR_mount_setattr 442
+__SYSCALL(__NR_mount_setattr, sys_mount_setattr)
+
 #undef __NR_syscalls
-#define __NR_syscalls 436
+#define __NR_syscalls 443
 
 /*
  * All syscalls below here should go away really,

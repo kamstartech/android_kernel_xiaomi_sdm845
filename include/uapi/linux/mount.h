@@ -61,4 +61,17 @@ enum fsconfig_command {
 #define MOUNT_ATTR_IDMAP        0x00100000
 #define MOUNT_ATTR_NOSYMFOLLOW  0x00200000
 
+/*
+ * mount_setattr()
+ */
+struct mount_attr {
+        __u64 attr_set;
+        __u64 attr_clr;
+        __u64 propagation;
+        __u64 userns_fd;
+};
+
+/* List of all mount_attr versions. */
+#define MOUNT_ATTR_SIZE_VER0    32 /* sizeof first published struct */
+
 #endif /* _UAPI_LINUX_MOUNT_H */
