@@ -409,6 +409,15 @@ asmlinkage long sys_mount(char __user *dev_name, char __user *dir_name,
 				void __user *data);
 asmlinkage long sys_umount(char __user *name, int flags);
 asmlinkage long sys_oldumount(char __user *name);
+asmlinkage long sys_open_tree(int dfd, const char __user *path, unsigned flags);
+asmlinkage long sys_move_mount(int from_dfd, const char __user *from_path,
+                               int to_dfd, const char __user *to_path,
+                               unsigned int flags);
+asmlinkage long sys_fsopen(const char __user *fsname, unsigned int flags);
+asmlinkage long sys_fsconfig(int fd, unsigned int cmd, const char __user *key,
+                             const void __user *value, int aux);
+asmlinkage long sys_fsmount(int fd, unsigned int flags, unsigned int attr_flags);
+asmlinkage long sys_fspick(int dfd, const char __user *path, unsigned int flags);
 asmlinkage long sys_truncate(const char __user *path, long length);
 asmlinkage long sys_ftruncate(unsigned int fd, unsigned long length);
 asmlinkage long sys_stat(const char __user *filename,
