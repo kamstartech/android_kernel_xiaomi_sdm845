@@ -20,23 +20,9 @@
 #include <linux/mount.h>
 #include <linux/pid_namespace.h>
 #include <linux/parser.h>
+#include <linux/slab.h>
 
 #include "internal.h"
-
-static int proc_test_super(struct super_block *sb, void *data)
-{
-	return sb->s_fs_info == data;
-}
-
-static int proc_set_super(struct super_block *sb, void *data)
-{
-	int err = set_anon_super(sb, NULL);
-	if (!err) {
-		struct pid_namespace *ns = (struct pid_namespace *)data;
-		sb->s_fs_info = get_pid_ns(ns);
-	}
-	return err;
-}
 
 enum {
 	Opt_gid, Opt_hidepid, Opt_err,
@@ -48,7 +34,7 @@ static const match_table_t tokens = {
 	{Opt_err, NULL},
 };
 
-static int proc_parse_options(char *options, struct pid_namespace *pid)
+int proc_parse_options(char *options, struct pid_namespace *pid)
 {
 	char *p;
 	substring_t args[MAX_OPT_ARGS];
@@ -100,45 +86,103 @@ int proc_remount(struct super_block *sb, int *flags, char *data)
 static struct dentry *proc_mount(struct file_system_type *fs_type,
 	int flags, const char *dev_name, void *data)
 {
-	int err;
-	struct super_block *sb;
 	struct pid_namespace *ns;
-	char *options;
+	struct dentry *root;
+	char *reparse_opts = NULL;
 
 	if (flags & MS_KERNMOUNT) {
 		ns = (struct pid_namespace *)data;
-		options = NULL;
+		data = NULL;
 	} else {
 		ns = task_active_pid_ns(current);
-		options = data;
 
-		/* Does the mounter have privilege over the pid namespace? */
-		if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN))
-			return ERR_PTR(-EPERM);
-	}
-
-	sb = sget(fs_type, proc_test_super, proc_set_super, flags, ns);
-	if (IS_ERR(sb))
-		return ERR_CAST(sb);
-
-	if (!proc_parse_options(options, ns)) {
-		deactivate_locked_super(sb);
-		return ERR_PTR(-EINVAL);
-	}
-
-	if (!sb->s_root) {
-		err = proc_fill_super(sb);
-		if (err) {
-			deactivate_locked_super(sb);
-			return ERR_PTR(err);
+		if (data) {
+			/*
+			 * Kaos/HybridOS fix, 2026-09-15 (see the big comment
+			 * below for why sget()-by-pointer was replaced by
+			 * mount_ns()/sget_userns()): sget_userns() may hand
+			 * back an *existing* procfs superblock for this pid
+			 * namespace without invoking proc_fill_super() again,
+			 * which is where hidepid=/gid= actually get parsed --
+			 * so this mount's own options would otherwise be
+			 * silently dropped whenever that happens. Keep an
+			 * independent copy to re-apply them explicitly after
+			 * mount_ns() returns, since proc_parse_options()
+			 * destructively strsep()s its input in place and we
+			 * don't know up front whether fill_super() will also
+			 * consume the original "data" buffer.
+			 */
+			reparse_opts = kstrdup(data, GFP_KERNEL);
+			if (!reparse_opts)
+				return ERR_PTR(-ENOMEM);
 		}
-
-		sb->s_flags |= MS_ACTIVE;
-		/* User space would break if executables appear on proc */
-		sb->s_iflags |= SB_I_NOEXEC;
 	}
 
-	return dget(sb->s_root);
+	/*
+	 * mount_ns() (fs/super.c) instead of a bare sget() keyed only by
+	 * "sb->s_fs_info == this pid_namespace pointer": that bare-pointer
+	 * match (still in kernel/pid_namespace.c's history as the pre-2016
+	 * behaviour, and again as of the "Revert 'proc: Convert proc_mount
+	 * to use mount_ns.'" Android common-kernel commit this replaces --
+	 * Bug: 79705088) ignores *which user namespace* is doing the
+	 * mounting. sget_userns(), which mount_ns() uses, additionally
+	 * requires the match's owning user_ns to agree, and EBUSYs
+	 * otherwise -- fatally, for anyone mounting via ns->user_ns instead
+	 * of current_user_ns() at the plain sget() call site, since
+	 * task_active_pid_ns(current)->user_ns is fixed at pid_ns creation
+	 * while current_user_ns() tracks whatever the caller's *current*
+	 * mount is running under.
+	 *
+	 * That fires every time a fresh PID namespace's first mount("proc")
+	 * call comes from a *different* user namespace than the one already
+	 * on file for it -- which is exactly what happens the moment a
+	 * sandboxer (bubblewrap, and anything using the same
+	 * unshare(CLONE_NEWUSER|CLONE_NEWPID) pattern -- Flatpak, Firejail,
+	 * systemd's PrivateUsers=+ProtectProc=) creates a new PID namespace:
+	 * the kernel's own bookkeeping mount from
+	 * pid_ns_prepare_proc() (fs/proc/root.c, called by
+	 * kernel/pid.c:alloc_pid() for every namespace's child-reaper pid,
+	 * automatically, before any userspace mount() call happens) already
+	 * registered a procfs superblock for that pid_namespace; the
+	 * sandboxed process's own later, explicit mount("proc", ...) call --
+	 * now running inside the brand-new user namespace it just
+	 * unshared -- collides with it under the bare-sget() scheme and
+	 * gets EBUSY, unconditionally, regardless of target path.
+	 * mount_ns()/sget_userns() use ns->user_ns (fixed, and identical for
+	 * both the kernel-internal and every later userspace mount of the
+	 * same pid_namespace) instead, so the mismatch this depends on can't
+	 * happen.
+	 *
+	 * Confirmed live on a Kaos/HybridOS Xiaomi Mi Mix 3 (perseus)
+	 * device, 2026-09-15: `bwrap --unshare-pid --unshare-user --proc
+	 * /proc ...` reliably hit this EBUSY (reproduced too with a minimal
+	 * unshare(CLONE_NEWUSER|CLONE_NEWPID) + mount("proc",...) program,
+	 * no bwrap involved) before this fix, and stopped after it.
+	 */
+	root = mount_ns(fs_type, flags, data, ns, ns->user_ns, proc_fill_super);
+
+	if (!IS_ERR(root) && reparse_opts) {
+		if (!proc_parse_options(reparse_opts, ns)) {
+			/*
+			 * mount_ns() returned with s_umount still held (its
+			 * contract: the caller -- mount_fs(), fs/super.c --
+			 * releases it, but only on the *success* path; once
+			 * type->mount() returns an error, as we're about to,
+			 * mount_fs() assumes we already released it
+			 * ourselves). dput(root) alone (as this used to do)
+			 * drops our dentry reference but leaves s_umount
+			 * permanently held -- same pattern mount_fs()'s own
+			 * out_sb: label uses for exactly this situation.
+			 */
+			struct super_block *sb = root->d_sb;
+			dput(root);
+			deactivate_locked_super(sb);
+			root = ERR_PTR(-EINVAL);
+		}
+	}
+	kfree(reparse_opts);
+
+	return root;
 }
 
 static void proc_kill_sb(struct super_block *sb)

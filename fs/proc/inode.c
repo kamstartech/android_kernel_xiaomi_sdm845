@@ -457,12 +457,26 @@ struct inode *proc_get_inode(struct super_block *sb, struct proc_dir_entry *de)
 	return inode;
 }
 
-int proc_fill_super(struct super_block *s)
+int proc_fill_super(struct super_block *s, void *data, int silent)
 {
+	/*
+	 * Kaos/HybridOS fix, 2026-09-15: get_pid_ns() here balances the
+	 * unconditional put_pid_ns() in proc_kill_sb() (fs/proc/root.c) --
+	 * this function only runs once, for a genuinely new superblock (see
+	 * mount_ns(), fs/super.c), so the refcounting stays 1:1 regardless
+	 * of how many times this pid_namespace's procfs gets mount()ed
+	 * afterwards. See proc_mount() (fs/proc/root.c) for why this
+	 * function is reached via mount_ns()/sget_userns() rather than a
+	 * bare sget() keyed on this pointer.
+	 */
+	struct pid_namespace *ns = get_pid_ns(s->s_fs_info);
 	struct inode *root_inode;
 	int ret;
 
-	s->s_iflags |= SB_I_USERNS_VISIBLE | SB_I_NODEV;
+	if (!proc_parse_options(data, ns))
+		return -EINVAL;
+
+	s->s_iflags |= SB_I_USERNS_VISIBLE | SB_I_NOEXEC | SB_I_NODEV;
 	s->s_flags |= MS_NODIRATIME | MS_NOSUID | MS_NOEXEC;
 	s->s_blocksize = 1024;
 	s->s_blocksize_bits = 10;
