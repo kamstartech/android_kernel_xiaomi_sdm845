@@ -126,6 +126,9 @@ config HAVE_KERNEL_LZO
 config HAVE_KERNEL_LZ4
 	bool
 
+config HAVE_COPY_THREAD_TLS
+	bool
+
 choice
 	prompt "Kernel compression mode"
 	default KERNEL_GZIP

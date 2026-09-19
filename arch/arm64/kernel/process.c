@@ -317,8 +317,9 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 
 asmlinkage void ret_from_fork(void) asm("ret_from_fork");
 
-int copy_thread(unsigned long clone_flags, unsigned long stack_start,
-		unsigned long stk_sz, struct task_struct *p)
+int copy_thread_tls(unsigned long clone_flags, unsigned long stack_start,
+		    unsigned long stk_sz, struct task_struct *p,
+		    unsigned long tls)
 {
 	struct pt_regs *childregs = task_pt_regs(p);
 
@@ -351,11 +352,16 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 		}
 
 		/*
-		 * If a TLS pointer was passed to clone (4th argument), use it
-		 * for the new thread.
+		 * Use the TLS pointer passed via the clone()/clone3()
+		 * argument (or 0 if CLONE_SETTLS not set). Reading it from
+		 * childregs->regs[3] only works for the classic aarch64
+		 * clone() syscall where the tls arrives in x3; clone3()
+		 * passes tls in struct clone_args, so regs[3] may hold
+		 * garbage (frequently 0), which crashes the new thread on
+		 * its first TLS access with a NULL-dereference.
 		 */
 		if (clone_flags & CLONE_SETTLS)
-			p->thread.tp_value = childregs->regs[3];
+			p->thread.tp_value = tls;
 	} else {
 		memset(childregs, 0, sizeof(struct pt_regs));
 		childregs->pstate = PSR_MODE_EL1h;
