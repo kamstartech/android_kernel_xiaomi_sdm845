@@ -182,7 +182,7 @@ void release_all_touches(struct fts_ts_info *info)
 #endif
 		input_mt_slot(info->input_dev, i);
 		input_mt_report_slot_state(info->input_dev, type, 0);
-		input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1);
+		/* input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1); */
 	}
 	input_sync(info->input_dev);
 	lpm_disable_for_input(false);
@@ -2807,7 +2807,7 @@ static void fts_leave_pointer_event_handler(struct fts_ts_info *info,
 			input_report_key(info->input_dev, BTN_TOOL_FINGER, 0);
 		lpm_disable_for_input(false);
 	}
-	input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1);
+	/* input_report_abs(info->input_dev, ABS_MT_TRACKING_ID, -1); */
 	/* pr_info("%s: Event 0x%02x - release ID[%d] type = %d\n",
 		 __func__, event[0], touchId, touchType); */
 #ifdef CONFIG_INPUT_PRESS_NDT
