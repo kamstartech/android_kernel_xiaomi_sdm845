@@ -5129,6 +5129,21 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		break;
 	}
+	case BINDER_ENABLE_ONEWAY_SPAM_DETECTION: {
+		__u32 enabled;
+
+		if (copy_from_user(&enabled, ubuf, sizeof(enabled))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		/* cmd 'b' 16 -- Android 13+ libbinder sends this during driver
+		 * init (ProcessState::setupDriver). This 4.9 tree has no binder
+		 * one-way spam-detection machinery (nor THREAD_POOL_EXHAUSTED as
+		 * 'b' 18 / GET_EXTENDED_ERROR as 'b' 17, both of which a newer
+		 * libbinder would merely fail with -EINVAL and tolerate). Ack
+		 * the enable so init proceeds; the feature is simply absent. */
+		break;
+	}
 	default:
 		ret = -EINVAL;
 		goto err;
