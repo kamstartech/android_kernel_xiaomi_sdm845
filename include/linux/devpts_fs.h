@@ -18,6 +18,8 @@
 #ifdef CONFIG_UNIX98_PTYS
 
 struct pts_fs_info;
+struct file;
+struct tty_struct;
 
 struct pts_fs_info *devpts_acquire(struct file *);
 void devpts_release(struct pts_fs_info *);
@@ -31,6 +33,9 @@ struct dentry *devpts_pty_new(struct pts_fs_info *, int, void *);
 void *devpts_get_priv(struct dentry *);
 /* unlink */
 void devpts_pty_kill(struct dentry *);
+
+/* safely open the peer (Linux 4.13, TIOCGPTPEER) */
+int ptm_open_peer(struct file *master, struct tty_struct *tty, int flags);
 
 #endif
 

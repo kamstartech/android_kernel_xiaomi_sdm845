@@ -3033,6 +3033,9 @@ long tty_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case TIOCSSERIAL:
 		tty_warn_deprecated_flags(p);
 		break;
+	case TIOCGPTPEER:
+		/* Special because the struct file is needed */
+		return ptm_open_peer(file, tty, (int)arg);
 	}
 	if (tty->ops->ioctl) {
 		retval = tty->ops->ioctl(tty, cmd, arg);

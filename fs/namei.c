@@ -1833,6 +1833,17 @@ static int pick_link(struct nameidata *nd, struct path *link,
 {
 	int error;
 	struct saved *last;
+
+	/*
+	 * MNT_NOSYMFOLLOW -- backported (5.10, MS_NOSYMFOLLOW / mount_setattr's
+	 * MOUNT_ATTR_NOSYMFOLLOW). Real upstream checks this alongside
+	 * LOOKUP_NO_SYMLINKS (openat2's RESOLVE_NO_SYMLINKS); that flag isn't
+	 * implemented on this kernel (see fs/open.c's sys_openat2()), so only
+	 * the mount-level restriction is enforced here.
+	 */
+	if (unlikely(link->mnt->mnt_flags & MNT_NOSYMFOLLOW))
+		return -ELOOP;
+
 	if (unlikely(nd->total_link_count++ >= MAXSYMLINKS)) {
 		path_to_nameidata(link, nd);
 		return -ELOOP;

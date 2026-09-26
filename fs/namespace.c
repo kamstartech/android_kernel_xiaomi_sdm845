@@ -2901,6 +2901,8 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 		mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
 	if (flags & MS_RDONLY)
 		mnt_flags |= MNT_READONLY;
+	if (flags & MS_NOSYMFOLLOW)
+		mnt_flags |= MNT_NOSYMFOLLOW;
 
 	/* The default atime for remount is preservation */
 	if ((flags & MS_REMOUNT) &&
@@ -4026,7 +4028,8 @@ SYSCALL_DEFINE3(fspick, int, dfd, const char __user *, path, unsigned int, flags
 
 #define MOUNT_SETATTR_VALID_ATTRS \
         (MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | \
-         MOUNT_ATTR_NOEXEC | MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME)
+         MOUNT_ATTR_NOEXEC | MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME | \
+         MOUNT_ATTR_NOSYMFOLLOW)
 
 static int mount_setattr_attr_to_mnt_flags(u64 attr_set, u64 attr_clr,
                                             unsigned int *set, unsigned int *clr)
@@ -4063,6 +4066,11 @@ static int mount_setattr_attr_to_mnt_flags(u64 attr_set, u64 attr_clr,
                 *set |= MNT_NODIRATIME;
         if (attr_clr & MOUNT_ATTR_NODIRATIME)
                 *clr |= MNT_NODIRATIME;
+
+        if (attr_set & MOUNT_ATTR_NOSYMFOLLOW)
+                *set |= MNT_NOSYMFOLLOW;
+        if (attr_clr & MOUNT_ATTR_NOSYMFOLLOW)
+                *clr |= MNT_NOSYMFOLLOW;
 
         atime = attr_set & MOUNT_ATTR__ATIME;
         if (atime == MOUNT_ATTR_NOATIME) {

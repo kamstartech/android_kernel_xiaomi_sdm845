@@ -24,6 +24,11 @@
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/poll.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/namei.h>
+#include <linux/magic.h>
+#include <linux/cred.h>
 
 #undef TTY_DEBUG_HANGUP
 #ifdef TTY_DEBUG_HANGUP
@@ -580,6 +585,74 @@ static inline void legacy_pty_init(void) { }
 #ifdef CONFIG_UNIX98_PTYS
 
 static struct cdev ptmx_cdev;
+
+/*
+ * ptm_open_peer / TIOCGPTPEER -- backported (Linux 4.13). Provides a
+ * race-free way for userspace to open the slave end of a pty from the
+ * master fd, without having to trust (or even be able to access) the
+ * mount namespace /dev/pts was mounted inside -- exactly the case for
+ * a cold-booted, pivot_root'd distro rootfs here. Confirmed as a
+ * systemd documented-baseline requirement (README: "kernel >= 4.13 for
+ * TIOCGPTPEER").
+ *
+ * This kernel has no devpts_mntget() helper (added alongside TIOCGPTPEER
+ * upstream), so the master's own path is resolved to the owning devpts
+ * mount the same way devpts_acquire() (fs/devpts/inode.c) already does
+ * for the exact same "master fd may or may not itself be directly on
+ * devpts" cases -- reusing that same proven path_pts() logic rather
+ * than inventing a second, less-reviewed one.
+ */
+static struct file *ptm_open_peer_file(struct file *master,
+				       struct tty_struct *tty, int flags)
+{
+	struct path path;
+	struct dentry *slave_dentry;
+	struct file *file;
+	int err;
+
+	slave_dentry = tty->link->driver_data;
+	if (!slave_dentry)
+		return ERR_PTR(-EIO);
+
+	path = master->f_path;
+	path_get(&path);
+
+	if (path.mnt->mnt_sb->s_magic != DEVPTS_SUPER_MAGIC) {
+		err = path_pts(&path);
+		if (err) {
+			path_put(&path);
+			return ERR_PTR(err);
+		}
+	}
+
+	dput(path.dentry);
+	path.dentry = dget(slave_dentry);
+
+	file = dentry_open(&path, flags, current_cred());
+	path_put(&path);
+	return file;
+}
+
+int ptm_open_peer(struct file *master, struct tty_struct *tty, int flags)
+{
+	int fd;
+	struct file *file;
+
+	if (tty->driver != ptm_driver)
+		return -EIO;
+
+	fd = get_unused_fd_flags(flags);
+	if (fd < 0)
+		return fd;
+
+	file = ptm_open_peer_file(master, tty, flags);
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		return PTR_ERR(file);
+	}
+	fd_install(fd, file);
+	return fd;
+}
 
 static int pty_unix98_ioctl(struct tty_struct *tty,
 			    unsigned int cmd, unsigned long arg)

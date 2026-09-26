@@ -173,6 +173,21 @@ static long ns_ioctl(struct file *filp, unsigned int ioctl,
 		if (!ns->ops->get_parent)
 			return -EINVAL;
 		return open_related_ns(ns, ns->ops->get_parent);
+	case NS_GET_NSTYPE:
+		/*
+		 * Backported (Linux 4.11). Real upstream later cached this
+		 * directly on struct ns_common as ns->ns_type (a perf
+		 * optimization); that field doesn't exist on this kernel's
+		 * struct ns_common, but the original, simpler 4.11
+		 * implementation this replaced just returned
+		 * ns->ops->type -- which every *ns_operations instance in
+		 * this tree already sets (CLONE_NEWNET/NEWUTS/NEWIPC/
+		 * NEWPID/NEWUSER/NEWNS/NEWCGROUP), so no other change is
+		 * needed. Confirmed live 2026-09-26 as a systemd
+		 * documented-baseline requirement (README: "kernel >= 4.11
+		 * for nsfs NS_GET_NSTYPE").
+		 */
+		return ns->ops->type;
 	default:
 		return -ENOTTY;
 	}
