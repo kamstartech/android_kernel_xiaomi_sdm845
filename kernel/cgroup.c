@@ -1675,6 +1675,10 @@ static int cgroup_show_options(struct seq_file *seq,
 		seq_puts(seq, ",noprefix");
 	if (root->flags & CGRP_ROOT_XATTR)
 		seq_puts(seq, ",xattr");
+	if (root->flags & CGRP_ROOT_NS_DELEGATE)
+		seq_puts(seq, ",nsdelegate");
+	if (root->flags & CGRP_ROOT_MEMORY_RECURSIVE_PROT)
+		seq_puts(seq, ",memory_recursiveprot");
 
 	spin_lock(&release_agent_path_lock);
 	if (strlen(root->release_agent_path))
@@ -1840,8 +1844,31 @@ static int cgroup_remount(struct kernfs_root *kf_root, int *flags, char *data)
 	u16 added_mask, removed_mask;
 
 	if (root == &cgrp_dfl_root) {
-		pr_err("remount is not allowed\n");
-		return -EINVAL;
+		/*
+		 * Allow remount of cgroup v2 to update nsdelegate and
+		 * memory_recursiveprot flags (needed by systemd).
+		 */
+		if (data) {
+			char *o, *opts_str = kstrdup(data, GFP_KERNEL);
+			if (opts_str) {
+				unsigned int new_flags = root->flags &
+					~(CGRP_ROOT_NS_DELEGATE |
+					  CGRP_ROOT_MEMORY_RECURSIVE_PROT);
+				o = opts_str;
+				while (o && *o) {
+					char *token = strsep(&o, ",");
+					if (!token || *token == '\0')
+						continue;
+					if (!strcmp(token, "nsdelegate"))
+						new_flags |= CGRP_ROOT_NS_DELEGATE;
+					else if (!strcmp(token, "memory_recursiveprot"))
+						new_flags |= CGRP_ROOT_MEMORY_RECURSIVE_PROT;
+				}
+				root->flags = new_flags;
+				kfree(opts_str);
+			}
+		}
+		return 0;
 	}
 
 	cgroup_lock_and_drain_offline(&cgrp_dfl_root.cgrp);
@@ -2127,9 +2154,35 @@ static struct dentry *cgroup_mount(struct file_system_type *fs_type,
 
 	if (is_v2) {
 		if (data) {
-			pr_err("cgroup2: unknown option \"%s\"\n", (char *)data);
-			put_cgroup_ns(ns);
-			return ERR_PTR(-EINVAL);
+			/*
+			 * Parse cgroup v2 mount options. Supports:
+			 *   nsdelegate       - enable cgroup namespace delegation
+			 *   memory_recursiveprot - recursive memory protection (accepted, no-op on 4.9)
+			 * Unknown options are rejected.
+			 */
+			char *o, *opts_str = kstrdup(data, GFP_KERNEL);
+			if (!opts_str) {
+				put_cgroup_ns(ns);
+				return ERR_PTR(-ENOMEM);
+			}
+			o = opts_str;
+			while (o && *o) {
+				char *token;
+				token = strsep(&o, ",");
+				if (!token || *token == '\0')
+					continue;
+				if (!strcmp(token, "nsdelegate")) {
+					cgrp_dfl_root.flags |= CGRP_ROOT_NS_DELEGATE;
+				} else if (!strcmp(token, "memory_recursiveprot")) {
+					cgrp_dfl_root.flags |= CGRP_ROOT_MEMORY_RECURSIVE_PROT;
+				} else {
+					pr_err("cgroup2: unknown option \"%s\"\n", token);
+					kfree(opts_str);
+					put_cgroup_ns(ns);
+					return ERR_PTR(-EINVAL);
+				}
+			}
+			kfree(opts_str);
 		}
 		cgrp_dfl_visible = true;
 		root = &cgrp_dfl_root;

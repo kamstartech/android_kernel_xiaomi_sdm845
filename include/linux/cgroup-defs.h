@@ -68,6 +68,8 @@ enum {
 enum {
 	CGRP_ROOT_NOPREFIX	= (1 << 1), /* mounted subsystems have no named prefix */
 	CGRP_ROOT_XATTR		= (1 << 2), /* supports extended attributes */
+	CGRP_ROOT_NS_DELEGATE	= (1 << 3), /* cgroup v2 namespace delegation */
+	CGRP_ROOT_MEMORY_RECURSIVE_PROT = (1 << 4), /* recursive memory protection (no-op on 4.9) */
 };
 
 /* cftype->flags */
