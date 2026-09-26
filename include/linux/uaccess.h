@@ -1,7 +1,9 @@
 #ifndef __LINUX_UACCESS_H__
 #define __LINUX_UACCESS_H__
 
+#include <linux/kernel.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 
 #define uaccess_kernel() segment_eq(get_fs(), KERNEL_DS)
 
@@ -146,5 +148,76 @@ extern long strnlen_unsafe_user(const void __user *unsafe_addr, long count);
 #define unsafe_get_user(x, ptr, err) do { if (unlikely(__get_user(x, ptr))) goto err; } while (0)
 #define unsafe_put_user(x, ptr, err) do { if (unlikely(__put_user(x, ptr))) goto err; } while (0)
 #endif
+
+/**
+ * check_zeroed_user / copy_struct_from_user -- backported (Linux 5.4+),
+ * matching mainline's own documented contract in this same header
+ * exactly (see mainline's copy_struct_from_user() kerneldoc for the
+ * full three-case description: usize == ksize copies verbatim, usize <
+ * ksize zero-fills the rest of dst, usize > ksize requires the extra
+ * src bytes to be zero or fails -E2BIG).
+ *
+ * Real upstream builds these on user_read_access_begin()/
+ * unsafe_get_user() -- a single range check up front (STAC/CLAC on
+ * x86), then repeated unchecked accesses. This kernel only has the
+ * no-op unsafe_get_user()/user_access_begin() fallback right above,
+ * which do NOT imply any access_ok() validation by themselves (unlike
+ * the real batched-access macros they stand in for) -- so the single
+ * up-front access_ok() below is done explicitly, then unsafe_get_user()
+ * is used in the loop exactly the way the real macro would have been
+ * used after a real user_read_access_begin(). Net effect: identical
+ * safety to mainline, one explicit check instead of one hidden behind
+ * a macro this kernel doesn't have.
+ *
+ * Added to consolidate what were three separate hand-rolled "extension
+ * bytes must be zero" loops (clone3, openat2, and any future extensible-
+ * struct syscall) into one place matching mainline's real, well-defined
+ * function instead of three independently-written copies that could
+ * drift from each other.
+ */
+static inline int check_zeroed_user(const void __user *from, size_t size)
+{
+	const unsigned char __user *p = from;
+	unsigned char val;
+
+	if (size == 0)
+		return 1;
+	if (!access_ok(VERIFY_READ, from, size))
+		return -EFAULT;
+
+	for (; size; size--, p++) {
+		unsafe_get_user(val, p, err_fault);
+		if (val)
+			return 0;
+	}
+	return 1;
+err_fault:
+	return -EFAULT;
+}
+
+static inline int copy_struct_from_user(void *dst, size_t ksize,
+					 const void __user *src, size_t usize)
+{
+	size_t size = min(ksize, usize);
+	size_t rest = max(ksize, usize) - size;
+
+	if (usize < ksize) {
+		if (copy_from_user(dst, src, usize))
+			return -EFAULT;
+		memset((char *)dst + size, 0, rest);
+		return 0;
+	}
+
+	if (copy_from_user(dst, src, ksize))
+		return -EFAULT;
+
+	if (usize > ksize) {
+		int ret = check_zeroed_user((const char __user *)src + size, rest);
+		if (ret <= 0)
+			return ret ?: -E2BIG;
+	}
+
+	return 0;
+}
 
 #endif		/* __LINUX_UACCESS_H__ */

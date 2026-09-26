@@ -12,6 +12,7 @@
  */
 
 #include <linux/anon_inodes.h>
+#include <linux/stddef.h>
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/unistd.h>
@@ -84,6 +85,7 @@
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
 #include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
@@ -2260,6 +2262,15 @@ static inline int clone3_args_valid(const struct clone_args *args)
 	return 0;
 }
 
+/*
+ * Size of the original 8-field struct clone_args (flags..tls), before
+ * set_tid/set_tid_size/cgroup were backported (see include/uapi/linux/
+ * sched.h). A caller built against the old, smaller struct must still
+ * work: it passes this size, not sizeof(struct clone_args). Named after
+ * mainline's own CLONE_ARGS_SIZE_VER0 for the same constant.
+ */
+#define CLONE_ARGS_SIZE_VER0 offsetof(struct clone_args, set_tid)
+
 SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)
 {
 	struct clone_args args;
@@ -2271,36 +2282,33 @@ SYSCALL_DEFINE2(clone3, struct clone_args __user *, uargs, size_t, size)
 	unsigned long tls = 0;
 	int ret;
 
-	if (size < sizeof(args))
+	if (size < CLONE_ARGS_SIZE_VER0)
 		return -EINVAL;
 	if (size > PAGE_SIZE)
 		return -E2BIG;
 
-	memset(&args, 0, sizeof(args));
-	if (copy_from_user(&args, uargs, sizeof(args)))
-		return -EFAULT;
-
-	/* Any extension fields must be zero. */
-	if (size > sizeof(args)) {
-		unsigned char __user *addr;
-		unsigned char __user *end;
-		unsigned char val;
-
-		addr = (void __user *)uargs + sizeof(args);
-		end = (void __user *)uargs + size;
-		for (; addr < end; addr++) {
-			if (get_user(val, addr))
-				return -EFAULT;
-			if (val)
-				return -E2BIG;
-		}
-	}
+	ret = copy_struct_from_user(&args, sizeof(args), uargs, size);
+	if (ret)
+		return ret;
 
 	ret = clone3_args_valid(&args);
 	if (ret)
 		return ret;
 
-	clone_flags = args.flags | args.exit_signal;
+	/* set_tid (precise child-TID placement) isn't implemented here. */
+	if (args.set_tid_size)
+		return -EOPNOTSUPP;
+
+	/*
+	 * CLONE_INTO_CGROUP/cgroup isn't implemented (no direct-into-cgroup
+	 * placement at fork time) -- silently accepted rather than
+	 * rejected, since callers that ask for it re-attach to the target
+	 * cgroup themselves right after fork if the kernel didn't do it
+	 * for them (see struct clone_args's comment in
+	 * include/uapi/linux/sched.h). Masked out of clone_flags below so
+	 * it can't reach _do_fork() as an unrecognized bit.
+	 */
+	clone_flags = (args.flags & ~CLONE_INTO_CGROUP) | args.exit_signal;
 
 	if (args.flags & CLONE_PIDFD) {
 		if (args.flags & CLONE_PARENT_SETTID)

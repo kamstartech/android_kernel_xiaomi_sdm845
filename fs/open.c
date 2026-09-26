@@ -20,6 +20,7 @@
 #include <linux/fcntl.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/personality.h>
 #include <linux/pagemap.h>
@@ -31,6 +32,7 @@
 #include <linux/ima.h>
 #include <linux/dnotify.h>
 #include <linux/compat.h>
+#include <uapi/linux/openat2.h>
 
 #include "internal.h"
 
@@ -358,12 +360,27 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
 /*
  * access() needs to use the real uid/gid, not the effective uid/gid.
  * We do this by temporarily clearing all FS-related capabilities and
- * switching the fsuid/fsgid around to the real ones.
+ * switching the fsuid/fsgid around to the real ones. AT_EACCESS (only
+ * reachable via faccessat2()) skips this and checks against the
+ * effective uid/gid instead, matching mainline semantics.
+ *
+ * faccessat2() itself (backported from Linux 5.8) is what systemd >=260
+ * needs for access_fd() -- faccessat(fd, "", mode, AT_EMPTY_PATH), i.e.
+ * checking access on an already-open fd with no real pathname. The
+ * classic 3-arg faccessat() syscall has no flags parameter at all and
+ * cannot express that; without faccessat2() glibc's faccessat() wrapper
+ * has no fallback for the AT_EMPTY_PATH+empty-path case and returns
+ * -EINVAL straight to the caller. Confirmed live 2026-09-26: this is
+ * exactly what made systemd[1]'s pin_callout_binary() fail with "Failed
+ * to pin executor binary: Invalid argument" -> "Failed to allocate
+ * manager object" -> Freezing execution, immediately after the
+ * STATX_ATTR_MOUNT_ROOT fix (see cp_statx() above) let it get past the
+ * earlier /proc/sys/dev mount-point checks.
  */
-SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+static long do_faccessat(int dfd, const char __user *filename, int mode, int flags)
 {
-	const struct cred *old_cred;
-	struct cred *override_cred;
+	const struct cred *old_cred = NULL;
+	struct cred *override_cred = NULL;
 	struct path path;
 	struct inode *inode;
 	struct vfsmount *mnt;
@@ -373,43 +390,53 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
 		return -EINVAL;
 
-	override_cred = prepare_creds();
-	if (!override_cred)
-		return -ENOMEM;
+	if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
 
-	override_cred->fsuid = override_cred->uid;
-	override_cred->fsgid = override_cred->gid;
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		lookup_flags &= ~LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
 
-	if (!issecure(SECURE_NO_SETUID_FIXUP)) {
-		/* Clear the capabilities if we switch to a non-root user */
-		kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
-		if (!uid_eq(override_cred->uid, root_uid))
-			cap_clear(override_cred->cap_effective);
-		else
-			override_cred->cap_effective =
-				override_cred->cap_permitted;
+	if (!(flags & AT_EACCESS)) {
+		override_cred = prepare_creds();
+		if (!override_cred)
+			return -ENOMEM;
+
+		override_cred->fsuid = override_cred->uid;
+		override_cred->fsgid = override_cred->gid;
+
+		if (!issecure(SECURE_NO_SETUID_FIXUP)) {
+			/* Clear the capabilities if we switch to a non-root user */
+			kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
+			if (!uid_eq(override_cred->uid, root_uid))
+				cap_clear(override_cred->cap_effective);
+			else
+				override_cred->cap_effective =
+					override_cred->cap_permitted;
+		}
+
+		/*
+		 * The new set of credentials can *only* be used in
+		 * task-synchronous circumstances, and does not need
+		 * RCU freeing, unless somebody then takes a separate
+		 * reference to it.
+		 *
+		 * NOTE! This is _only_ true because this credential
+		 * is used purely for override_creds() that installs
+		 * it as the subjective cred. Other threads will be
+		 * accessing ->real_cred, not the subjective cred.
+		 *
+		 * If somebody _does_ make a copy of this (using the
+		 * 'get_current_cred()' function), that will clear the
+		 * non_rcu field, because now that other user may be
+		 * expecting RCU freeing. But normal thread-synchronous
+		 * cred accesses will keep things non-RCY.
+		 */
+		override_cred->non_rcu = 1;
+
+		old_cred = override_creds(override_cred);
 	}
-
-	/*
-	 * The new set of credentials can *only* be used in
-	 * task-synchronous circumstances, and does not need
-	 * RCU freeing, unless somebody then takes a separate
-	 * reference to it.
-	 *
-	 * NOTE! This is _only_ true because this credential
-	 * is used purely for override_creds() that installs
-	 * it as the subjective cred. Other threads will be
-	 * accessing ->real_cred, not the subjective cred.
-	 *
-	 * If somebody _does_ make a copy of this (using the
-	 * 'get_current_cred()' function), that will clear the
-	 * non_rcu field, because now that other user may be
-	 * expecting RCU freeing. But normal thread-synchronous
-	 * cred accesses will keep things non-RCY.
-	 */
-	override_cred->non_rcu = 1;
-
-	old_cred = override_creds(override_cred);
 retry:
 	res = user_path_at(dfd, filename, lookup_flags, &path);
 	if (res)
@@ -452,14 +479,27 @@ out_path_release:
 		goto retry;
 	}
 out:
-	revert_creds(old_cred);
-	put_cred(override_cred);
+	if (old_cred) {
+		revert_creds(old_cred);
+		put_cred(override_cred);
+	}
 	return res;
+}
+
+SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+{
+	return do_faccessat(dfd, filename, mode, 0);
+}
+
+SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,
+		int, flags)
+{
+	return do_faccessat(dfd, filename, mode, flags);
 }
 
 SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
 {
-	return sys_faccessat(AT_FDCWD, filename, mode);
+	return do_faccessat(AT_FDCWD, filename, mode, 0);
 }
 
 SYSCALL_DEFINE1(chdir, const char __user *, filename)
@@ -1119,6 +1159,62 @@ SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 		flags |= O_LARGEFILE;
 
 	return do_sys_open(dfd, filename, flags, mode);
+}
+
+/*
+ * openat2() -- backported (Linux 5.6). Confirmed live 2026-09-26: with
+ * close_range() fixed (see fs/file.c), /usr/bin/mount (for system.mount)
+ * and systemd-modules-load.service both got past their FDS-closing step
+ * but then hung indefinitely rather than exiting -- both are typical
+ * openat2() callers (safe, symlink-race-resistant path resolution).
+ *
+ * Only the plain case -- how->resolve == 0, i.e. "behave like openat()"
+ * -- is implemented, by extracting flags/mode from the how struct and
+ * reusing the existing do_sys_open(). None of the RESOLVE_* path-walk-
+ * time restriction flags (RESOLVE_BENEATH, RESOLVE_IN_ROOT, etc.) are
+ * enforced -- doing so correctly means threading extra state through
+ * every step of namei.c's path walk, real security-sensitive work well
+ * beyond this device's actual need. A caller that asks for one of those
+ * guarantees gets -EOPNOTSUPP rather than a silent, weaker-than-
+ * requested open -- callers depending on this device's mundane path
+ * resolution (mount, systemd-modules-load) don't set any resolve bits.
+ */
+SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
+		struct open_how __user *, uhow, size_t, usize)
+{
+	struct open_how how;
+	int flags;
+	int err;
+
+	if (unlikely(usize < OPEN_HOW_SIZE_VER0))
+		return -EINVAL;
+	if (unlikely(usize > PAGE_SIZE))
+		return -E2BIG;
+
+	err = copy_struct_from_user(&how, sizeof(how), uhow, usize);
+	if (err)
+		return err;
+
+	if (how.resolve != 0)
+		return -EOPNOTSUPP;
+	if (how.flags & ~((__u64)VALID_OPEN_FLAGS))
+		return -EINVAL;
+	/*
+	 * Per openat2(2): mode must be zero unless O_CREAT or O_TMPFILE
+	 * (== __O_TMPFILE | O_DIRECTORY, both real bits) is given -- unlike
+	 * legacy openat(), a stray nonzero mode here is a hard error, not
+	 * silently-ignored noise.
+	 */
+	if (how.mode && !(how.flags & (O_CREAT | __O_TMPFILE)))
+		return -EINVAL;
+	if (how.mode & ~((__u64)S_IALLUGO))
+		return -EINVAL;
+
+	flags = (int)how.flags;
+	if (force_o_largefile())
+		flags |= O_LARGEFILE;
+
+	return do_sys_open(dfd, filename, flags, (umode_t)how.mode);
 }
 
 #ifndef __alpha__

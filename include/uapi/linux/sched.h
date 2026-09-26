@@ -31,6 +31,11 @@
 #define CLONE_NEWPID		0x20000000	/* New pid namespace */
 #define CLONE_NEWNET		0x40000000	/* New network namespace */
 #define CLONE_IO		0x80000000	/* Clone io context */
+#define CLONE_INTO_CGROUP	0x200000000ULL	/* Clone into a specific cgroup given the right permissions.
+						 * Backported (Linux 5.7) so clone3()'s struct clone_args can
+						 * be the modern (cgroup-field) size without hitting -E2BIG --
+						 * see the cgroup field comment on struct clone_args below and
+						 * sys_clone3()'s handling of it in kernel/fork.c. */
 
 /*
  * Arguments for the clone3 syscall
@@ -44,6 +49,30 @@ struct clone_args {
 	__aligned_u64 stack;
 	__aligned_u64 stack_size;
 	__aligned_u64 tls;
+	/*
+	 * set_tid/set_tid_size (Linux 5.5) and cgroup (Linux 5.7, paired
+	 * with CLONE_INTO_CGROUP above) backported so the struct is the
+	 * full modern size. sys_clone3() in kernel/fork.c rejects a
+	 * nonzero set_tid_size (precise-TID placement isn't implemented
+	 * here) but silently accepts a nonzero cgroup (CLONE_INTO_CGROUP
+	 * isn't implemented either, but callers that ask for it -- e.g.
+	 * systemd's sd-executor spawn path -- already re-attach to the
+	 * target cgroup themselves right after the fork if the kernel
+	 * didn't do it for them, so a no-op here doesn't lose anything).
+	 * Confirmed live 2026-09-26: without these three fields present,
+	 * glibc >=2.39's clone3() wrapper (used by posix_spawn(), which
+	 * systemd-executor's spawn path uses) passed a struct larger than
+	 * this one with a nonzero cgroup field, and the kernel's own
+	 * "any extension bytes beyond what I know must be zero" check
+	 * (mandatory ABI-compat behavior, not a bug) correctly rejected
+	 * that as -E2BIG -- surfacing as "ssh.service: Failed to spawn
+	 * executor: Argument list too long" and looping through systemd's
+	 * restart backoff for ~3.5 minutes before eventually giving up
+	 * retrying via this path.
+	 */
+	__aligned_u64 set_tid;
+	__aligned_u64 set_tid_size;
+	__aligned_u64 cgroup;
 };
 
 /*

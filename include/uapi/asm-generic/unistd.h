@@ -752,14 +752,52 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
 __SYSCALL(__NR_clone3, sys_clone3)
 
 /*
- * 436-441 are intentionally left unused here (openat2, pidfd_getfd,
- * faccessat2, watch_mount, watch_sb and fsinfo/quotactl_fd on some arches
- * upstream) -- this backport only adds the one new-mount-API syscall the
- * hardened systemd units (ProtectSystem=strict et al) actually invoke to
- * apply MOUNT_ATTR_* flags after open_tree()/move_mount(), so
+ * 438, 440, 441 are intentionally left unused here (pidfd_getfd,
+ * process_madvise, process_mrelease upstream).
+ *
+ * 436 (close_range), 437 (openat2) and 439 (faccessat2) WERE filled in
+ * below -- confirmed live 2026-09-26 booting Kali's systemd 261 cold:
+ * - 439 (faccessat2): systemd >=260's pin_callout_binary() (pins
+ *   systemd-executor at startup) calls access_fd(), which is
+ *   faccessat(fd, "", mode, AT_EMPTY_PATH) -- a combination the classic
+ *   3-arg faccessat() syscall cannot express at all (it never had a
+ *   flags parameter), so without faccessat2() glibc has no fallback and
+ *   returns -EINVAL straight through. Surfaced as "Failed to pin
+ *   executor binary: Invalid argument" -> "Failed to allocate manager
+ *   object" -> Freezing execution, immediately after the
+ *   STATX_ATTR_MOUNT_ROOT fix (see fs/stat.c's cp_statx()) got PID 1
+ *   past the earlier mount-point checks.
+ * - 436 (close_range): systemd's own service executor closes all
+ *   inherited fds above a small count before exec'ing each unit's
+ *   binary. Without close_range(), that failed with ENOSYS
+ *   ("Function not implemented"), which a good number of units (our
+ *   own kaos-droid-hal-prepare.service among them, plus ldconfig,
+ *   systemd-tmpfiles-setup, systemd-binfmt, console-setup, ...) treat
+ *   as a hard failure ("Failed at step FDS spawning ...") rather than
+ *   the softer/tolerated case a couple of other units happened to
+ *   accept.
+ * - 437 (openat2): with close_range() fixed, /usr/bin/mount (for
+ *   system.mount) and systemd-modules-load.service both got past their
+ *   own FDS spawn step but then hung indefinitely instead of exiting
+ *   (no "died" event ever logged for either, each eventually force-
+ *   killed by its own unit's start timeout) -- util-linux's mount and
+ *   systemd's own tools are common openat2() callers for safe,
+ *   symlink-race-resistant path resolution. See fs/open.c's
+ *   sys_openat2() for exactly how much of it is implemented here (the
+ *   plain resolve=0 case only, reusing do_sys_open() -- the RESOLVE_*
+ *   path-walk-time restriction flags are rejected with -EOPNOTSUPP
+ *   rather than silently granting less restriction than requested).
+ *
  * __NR_mount_setattr keeps its real upstream number (442) rather than
- * being renumbered down, in case a later backport fills the gap.
+ * being renumbered down, in case a later backport fills the three
+ * remaining gaps (438, 440, 441) too.
  */
+#define __NR_close_range 436
+__SYSCALL(__NR_close_range, sys_close_range)
+#define __NR_openat2 437
+__SYSCALL(__NR_openat2, sys_openat2)
+#define __NR_faccessat2 439
+__SYSCALL(__NR_faccessat2, sys_faccessat2)
 #define __NR_mount_setattr 442
 __SYSCALL(__NR_mount_setattr, sys_mount_setattr)
 

@@ -513,21 +513,27 @@ EXPORT_SYMBOL(inode_set_bytes);
 
 /**
  * cp_statx - copy kstat to userspace statx buffer
- * @mnt: vfsmount for mount ID
+ * @path: resolved path (dentry + vfsmount), for mount ID and mount-root detection
  * @stat: kernel stat data
  * @buffer: userspace statx buffer
  *
  * Converts a kernel kstat structure into a userspace struct statx,
- * including the mount ID from the vfsmount.
+ * including the mount ID from the vfsmount and the STATX_ATTR_MOUNT_ROOT
+ * attribute (mainline since 5.8; needed by systemd >=260's
+ * is_mount_point_at(), which treats it as mandatory and otherwise fails
+ * the whole statx() call with -EUNATCH -- confirmed live 2026-09-26:
+ * without this, systemd[1] froze itself at "Failed to determine whether
+ * /proc is a mount point: Protocol driver not attached" a few ms after
+ * exec, before mounting anything else).
  */
-static int cp_statx(struct vfsmount *mnt, struct kstat *stat,
+static int cp_statx(const struct path *path, struct kstat *stat,
 		    struct statx __user *buffer)
 {
 	struct statx tmp;
 
 	memset(&tmp, 0, sizeof(tmp));
 
-	tmp.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
+	tmp.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID | STATX_MNT_ID_UNIQUE;
 	tmp.stx_blksize = stat->blksize;
 	tmp.stx_nlink = stat->nlink;
 	tmp.stx_uid = from_kuid_munged(current_user_ns(), stat->uid);
@@ -536,7 +542,9 @@ static int cp_statx(struct vfsmount *mnt, struct kstat *stat,
 	tmp.stx_ino = stat->ino;
 	tmp.stx_size = stat->size;
 	tmp.stx_blocks = stat->blocks;
-	tmp.stx_attributes_mask = 0;
+	tmp.stx_attributes_mask = STATX_ATTR_MOUNT_ROOT;
+	if (path->mnt->mnt_root == path->dentry)
+		tmp.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
 	tmp.stx_atime.tv_sec = stat->atime.tv_sec;
 	tmp.stx_atime.tv_nsec = stat->atime.tv_nsec;
 	tmp.stx_btime.tv_sec = 0;
@@ -549,7 +557,7 @@ static int cp_statx(struct vfsmount *mnt, struct kstat *stat,
 	tmp.stx_rdev_minor = MINOR(stat->rdev);
 	tmp.stx_dev_major = MAJOR(stat->dev);
 	tmp.stx_dev_minor = MINOR(stat->dev);
-	tmp.stx_mnt_id = real_mount(mnt)->mnt_id;
+	tmp.stx_mnt_id = real_mount(path->mnt)->mnt_id;
 
 	if (copy_to_user(buffer, &tmp, sizeof(tmp)))
 		return -EFAULT;
@@ -591,7 +599,7 @@ retry:
 
 	error = vfs_getattr(&path, &stat);
 	if (!error)
-		error = cp_statx(path.mnt, &stat, buffer);
+		error = cp_statx(&path, &stat, buffer);
 
 	path_put(&path);
 	if (retry_estale(error, lookup_flags)) {

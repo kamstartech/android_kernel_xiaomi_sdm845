@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
+#include <uapi/linux/close_range.h>
 
 unsigned int sysctl_nr_open __read_mostly = 1024*1024;
 unsigned int sysctl_nr_open_min = BITS_PER_LONG;
@@ -1012,6 +1013,65 @@ int f_dupfd(unsigned int from, struct file *file, unsigned flags)
 		fd_install(err, file);
 	}
 	return err;
+}
+
+/*
+ * close_range() -- backported (Linux 5.9; CLOSE_RANGE_CLOEXEC added in
+ * 5.11). Confirmed live 2026-09-26: without this, systemd's own service
+ * executor (which closes all inherited fds above a small count before
+ * exec'ing each unit's binary) got ENOSYS ("Function not implemented"),
+ * which several units -- including this project's own
+ * kaos-droid-hal-prepare.service, plus ldconfig.service,
+ * systemd-tmpfiles-setup.service, systemd-binfmt.service and
+ * console-setup.service -- treat as a hard failure ("Failed at step FDS
+ * spawning ...") rather than tolerating it the way a couple of other
+ * units happened to.
+ *
+ * CLOSE_RANGE_UNSHARE is deliberately NOT implemented: it needs a
+ * private copy of files_struct to close into (for a files_struct
+ * currently shared via CLONE_FILES), which would mean exporting and
+ * reusing kernel/fork.c's unshare_fd() -- real extra plumbing for a
+ * mode nothing on this device actually asks for. systemd-executor's own
+ * spawn path (the reason this syscall exists here at all) always closes
+ * ranges in its own already-private post-fork fd table with flags=0.
+ */
+SYSCALL_DEFINE3(close_range, unsigned int, fd, unsigned int, max_fd,
+		unsigned int, flags)
+{
+	struct files_struct *files = current->files;
+	struct fdtable *fdt;
+	unsigned int cur_max;
+
+	if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC))
+		return -EINVAL;
+	if (fd > max_fd)
+		return -EINVAL;
+	if (flags & CLOSE_RANGE_UNSHARE)
+		return -EOPNOTSUPP;
+
+	spin_lock(&files->file_lock);
+	fdt = files_fdtable(files);
+	cur_max = fdt->max_fds;
+	spin_unlock(&files->file_lock);
+
+	if (cur_max == 0)
+		return 0;
+	if (max_fd >= cur_max)
+		max_fd = cur_max - 1;
+
+	for (; fd <= max_fd; fd++) {
+		if (flags & CLOSE_RANGE_CLOEXEC) {
+			spin_lock(&files->file_lock);
+			fdt = files_fdtable(files);
+			if (fd < fdt->max_fds && fdt->fd[fd])
+				__set_close_on_exec(fd, fdt);
+			spin_unlock(&files->file_lock);
+		} else {
+			__close_fd(files, fd);
+		}
+	}
+
+	return 0;
 }
 
 int iterate_fd(struct files_struct *files, unsigned n,
