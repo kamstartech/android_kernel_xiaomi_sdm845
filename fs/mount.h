@@ -23,6 +23,19 @@ struct mnt_pcp {
 	int mnt_writers;
 };
 
+/*
+ * A namespace with seq == 0 is an "anonymous" one -- privately created by
+ * alloc_mnt_ns(..., true) to back a still-detached fsmount()/open_tree(
+ * OPEN_TREE_CLONE) fd that hasn't (or will never be) attached anywhere via
+ * move_mount(). Real sequence numbers from atomic64_add_return() in
+ * alloc_mnt_ns() start at 1, so this can never collide. Matches mainline's
+ * own is_anon_ns() exactly.
+ */
+static inline bool is_anon_ns(struct mnt_namespace *ns)
+{
+	return ns->seq == 0;
+}
+
 struct mountpoint {
 	struct hlist_node m_hash;
 	struct dentry *m_dentry;

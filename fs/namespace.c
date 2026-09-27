@@ -30,6 +30,18 @@
 #include "pnode.h"
 #include "internal.h"
 
+/*
+ * TEMPORARY DIAGNOSTIC (2026-09-27): tracing a real kernel VFS corruption
+ * (mntput_no_expire()/propagate_one() oopses, confirmed live and fully
+ * reproducible on Kali cold boot). See the "New mount API backport"
+ * comment further down for the full write-up; defined up here so it's
+ * usable from attach_recursive_mnt() too, not just the syscall entry
+ * points. Remove once root-caused.
+ */
+#define KAOS_MNTAPI_LOG(fmt, ...) \
+	printk(KERN_INFO "kaos-mount-api: pid=%d comm=%s " fmt "\n", \
+	       current->pid, current->comm, ##__VA_ARGS__)
+
 /* Maximum number of mounts in a mount namespace */
 unsigned int sysctl_mount_max __read_mostly = 100000;
 
@@ -1107,6 +1119,23 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 		if (IS_MNT_SLAVE(old))
 			list_add(&mnt->mnt_slave, &old->mnt_slave);
 		mnt->mnt_master = old->mnt_master;
+	} else {
+		/*
+		 * CL_PRIVATE: mnt->mnt.mnt_flags was just copied wholesale
+		 * from old->mnt.mnt_flags above, which includes MNT_SHARED
+		 * if old was shared. mnt_group_id was already zeroed for
+		 * this case, but the flag itself was never cleared here --
+		 * a real divergence from mainline's clone_mnt(), which has
+		 * exactly this else branch. Left as-is, a CL_PRIVATE clone
+		 * (e.g. open_tree(OPEN_TREE_CLONE) without AT_RECURSIVE)
+		 * ends up with MNT_SHARED set, mnt_group_id == 0, and an
+		 * empty/self-referential mnt_share list -- an invariant
+		 * violation that later corrupts propagate_one()/umount_tree()
+		 * peer-group handling. Root-caused live 2026-09-27 via the
+		 * kaos-mount-api diagnostic log showing shared=4096 on a
+		 * CL_PRIVATE clone that should have been private.
+		 */
+		CLEAR_MNT_SHARED(mnt);
 	}
 	if (flag & CL_MAKE_SHARED)
 		set_mnt_shared(mnt);
@@ -2094,6 +2123,7 @@ int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
  * Must be called without spinlocks held, since this function can sleep
  * in allocations.
  */
+static void free_mnt_ns(struct mnt_namespace *ns);
 static int attach_recursive_mnt(struct mount *source_mnt,
 			struct mount *dest_mnt,
 			struct mountpoint *dest_mp,
@@ -2101,6 +2131,7 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 {
 	HLIST_HEAD(tree_list);
 	struct mnt_namespace *ns = dest_mnt->mnt_ns;
+	struct mnt_namespace *old_anon_ns = NULL;
 	struct mountpoint *smp;
 	struct mount *child, *p;
 	struct hlist_node *n;
@@ -2138,6 +2169,29 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 		attach_mnt(source_mnt, dest_mnt, dest_mp);
 		touch_mnt_namespace(source_mnt->mnt_ns);
 	} else {
+		if (source_mnt->mnt_ns) {
+			/*
+			 * Moving out of its anon namespace (see
+			 * kaos_attach_anon_ns()) -- detach from that
+			 * namespace's own list before commit_tree() below
+			 * reassigns mnt_ns to the real destination namespace.
+			 * Matches real mainline's attach_recursive_mnt()
+			 * exactly; this step was the one piece missing here.
+			 *
+			 * Unlike mainline (whose comment says "the caller
+			 * will destroy" -- true for it, since its detached-
+			 * mount fd is a real dentry_open() file checked for
+			 * FMODE_NEED_UNMOUNT generically in fs/file_table.c's
+			 * __fput(), which this backport deliberately doesn't
+			 * touch), nothing else here will ever see this exact
+			 * mnt_namespace pointer again once commit_tree()
+			 * below overwrites source_mnt->mnt_ns -- so free it
+			 * ourselves once unlocked, below, rather than leaking
+			 * it.
+			 */
+			old_anon_ns = source_mnt->mnt_ns;
+			list_del_init(&old_anon_ns->list);
+		}
 		mnt_set_mountpoint(dest_mnt, dest_mp, source_mnt);
 		commit_tree(source_mnt);
 	}
@@ -2153,6 +2207,9 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 	}
 	put_mountpoint(smp);
 	unlock_mount_hash();
+
+	if (old_anon_ns)
+		free_mnt_ns(old_anon_ns);
 
 	return 0;
 
@@ -2945,7 +3002,18 @@ static void dec_mnt_namespaces(struct ucounts *ucounts)
 
 static void free_mnt_ns(struct mnt_namespace *ns)
 {
-	ns_free_inum(&ns->ns);
+	/*
+	 * Anon namespaces (alloc_mnt_ns(..., true)) never went through
+	 * ns_alloc_inum() in the first place -- inum is left at 0 since an
+	 * anon namespace is never visible in /proc. Freeing an inum that
+	 * was never allocated hits ida_remove() on an unallocated id.
+	 * Matches real mainline's free_mnt_ns(), which has this same guard.
+	 * Root-caused live 2026-09-27 via "ida_remove called for id=...
+	 * which is not allocated" immediately preceding a kaos-mount-api
+	 * fsmount()/close() sequence in kaos_dissolve_detached_mnt().
+	 */
+	if (!is_anon_ns(ns))
+		ns_free_inum(&ns->ns);
 	dec_mnt_namespaces(ns->ucounts);
 	put_user_ns(ns->user_ns);
 	kfree(ns);
@@ -2960,7 +3028,7 @@ static void free_mnt_ns(struct mnt_namespace *ns)
  */
 static atomic64_t mnt_ns_seq = ATOMIC64_INIT(1);
 
-static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
+static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns, bool anon)
 {
 	struct mnt_namespace *new_ns;
 	struct ucounts *ucounts;
@@ -2975,14 +3043,26 @@ static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
 		dec_mnt_namespaces(ucounts);
 		return ERR_PTR(-ENOMEM);
 	}
-	ret = ns_alloc_inum(&new_ns->ns);
-	if (ret) {
-		kfree(new_ns);
-		dec_mnt_namespaces(ucounts);
-		return ERR_PTR(ret);
+	/*
+	 * anon namespaces (backing a still-detached fsmount()/open_tree(
+	 * OPEN_TREE_CLONE) fd, never attached anywhere via move_mount())
+	 * skip ns_alloc_inum() and keep seq at its zero-init default --
+	 * is_anon_ns() below tests exactly that, matching real mainline
+	 * (fs/namespace.c's alloc_mnt_ns(), same anon-bool signature).
+	 */
+	if (!anon) {
+		ret = ns_alloc_inum(&new_ns->ns);
+		if (ret) {
+			kfree(new_ns);
+			dec_mnt_namespaces(ucounts);
+			return ERR_PTR(ret);
+		}
+	} else {
+		atomic_long_set(&new_ns->ns.stashed, 0);
+		new_ns->ns.inum = 0;
 	}
 	new_ns->ns.ops = &mntns_operations;
-	new_ns->seq = atomic64_add_return(1, &mnt_ns_seq);
+	new_ns->seq = anon ? 0 : atomic64_add_return(1, &mnt_ns_seq);
 	atomic_set(&new_ns->count, 1);
 	new_ns->root = NULL;
 	INIT_LIST_HEAD(&new_ns->list);
@@ -3015,7 +3095,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
 
 	old = ns->root;
 
-	new_ns = alloc_mnt_ns(user_ns);
+	new_ns = alloc_mnt_ns(user_ns, false);
 	if (IS_ERR(new_ns))
 		return new_ns;
 
@@ -3076,7 +3156,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
  */
 static struct mnt_namespace *create_mnt_ns(struct vfsmount *m)
 {
-	struct mnt_namespace *new_ns = alloc_mnt_ns(&init_user_ns);
+	struct mnt_namespace *new_ns = alloc_mnt_ns(&init_user_ns, false);
 	if (!IS_ERR(new_ns)) {
 		struct mount *mnt = real_mount(m);
 		mnt->mnt_ns = new_ns;
@@ -3620,12 +3700,88 @@ static const struct file_operations fs_context_fops = {
         .llseek         = no_llseek,
 };
 
+/*
+ * kaos_attach_anon_ns() -- give a freshly-created detached mount (from
+ * fsmount() or open_tree(OPEN_TREE_CLONE)) a real, valid mnt_namespace
+ * immediately, instead of leaving mnt_ns NULL for its whole detached
+ * lifetime. For a recursive clone this covers every mount in the tree,
+ * matching real mainline's open_detached_copy()/fsmount() (both call
+ * alloc_mnt_ns(..., true) and this same per-mount assignment loop).
+ *
+ * Root-caused live 2026-09-27: without this, mntput_no_expire(),
+ * attach_recursive_mnt() and propagate_one() -- all faithfully ported
+ * from real mainline -- oops on real kernel memory corruption, because
+ * they were written assuming mnt_ns is only ever transiently NULL
+ * (during the handful of instructions inside clone_mnt() itself), never
+ * a mount's actual, ongoing state across multiple syscalls and forks
+ * the way this "minimal" backport left it. Confirmed via live kmsg
+ * instrumentation: systemd-journald's own open_tree(OPEN_TREE_CLONE)
+ * call (used for its ProtectSystem=/PrivateTmp=-style sandbox setup,
+ * completely standard systemd behavior) reliably produced mnt_ns=NULL
+ * mounts that later corrupted the kernel's mount-propagation state.
+ */
+static int kaos_attach_anon_ns(struct mount *mnt)
+{
+        struct mnt_namespace *ns;
+        struct mount *p;
+
+        ns = alloc_mnt_ns(current->nsproxy->mnt_ns->user_ns, true);
+        if (IS_ERR(ns))
+                return PTR_ERR(ns);
+
+        lock_mount_hash();
+        for (p = mnt; p; p = next_mnt(p, mnt)) {
+                p->mnt_ns = ns;
+                ns->mounts++;
+        }
+        ns->root = mnt;
+        list_add_tail(&ns->list, &mnt->mnt_list);
+        unlock_mount_hash();
+        return 0;
+}
+
+/*
+ * kaos_dissolve_detached_mnt() -- backported from real mainline's
+ * dissolve_on_fput(). A detached mount that was never attached anywhere
+ * still belongs to the private anon mnt_namespace kaos_attach_anon_ns()
+ * gave it -- tear the whole tree down together with that namespace,
+ * rather than a plain mntput() (which -- correctly, per
+ * mntput_no_expire()'s very first check -- refuses to free anything
+ * belonging to a live mnt_ns, anon or not, since that check alone can't
+ * distinguish "still sitting in the anon namespace nobody else
+ * references" from "properly attached and referenced elsewhere"). If it
+ * *was* successfully attached via move_mount(), mnt_ns by this point is
+ * the real destination namespace (commit_tree() reassigned it), not the
+ * anon one -- is_anon_ns() correctly says no here, and a plain mntput()
+ * is exactly right, same as this always did before.
+ */
+static void kaos_dissolve_detached_mnt(struct vfsmount *mnt)
+{
+        struct mount *m = real_mount(mnt);
+        struct mnt_namespace *ns;
+
+        namespace_lock();
+        lock_mount_hash();
+        ns = m->mnt_ns;
+        if (ns && is_anon_ns(ns))
+                umount_tree(m, UMOUNT_CONNECTED);
+        else
+                ns = NULL;
+        unlock_mount_hash();
+        namespace_unlock();
+
+        if (ns)
+                free_mnt_ns(ns);
+        else
+                mntput(mnt);
+}
+
 static int mount_fops_release(struct inode *inode, struct file *file)
 {
         struct vfsmount *mnt = file->private_data;
 
         if (mnt)
-                mntput(mnt);
+                kaos_dissolve_detached_mnt(mnt);
         return 0;
 }
 
@@ -3668,6 +3824,7 @@ SYSCALL_DEFINE2(fsopen, const char __user *, fsname, unsigned int, flags)
                               O_RDWR | (flags & FSOPEN_CLOEXEC ? O_CLOEXEC : 0));
         if (fd < 0)
                 fs_context_free(fc);
+        KAOS_MNTAPI_LOG("fsopen fc=%p fd=%d", fc, fd);
         return fd;
 }
 
@@ -3694,6 +3851,8 @@ SYSCALL_DEFINE5(fsconfig, int, fd, unsigned int, cmd, const char __user *, _key,
         struct fs_context *fc;
         char *key = NULL, *value = NULL;
         int ret;
+
+        KAOS_MNTAPI_LOG("fsconfig fd=%d cmd=%u", fd, cmd);
 
         switch (cmd) {
         case FSCONFIG_SET_FLAG:
@@ -3785,6 +3944,7 @@ SYSCALL_DEFINE5(fsconfig, int, fd, unsigned int, cmd, const char __user *, _key,
 out:
         kfree(key);
         kfree(value);
+        KAOS_MNTAPI_LOG("fsconfig fd=%d cmd=%u -> ret=%d", fd, cmd, ret);
         return ret;
 }
 
@@ -3815,10 +3975,22 @@ SYSCALL_DEFINE3(fsmount, int, fd, unsigned int, flags, unsigned int, attr_flags)
         mnt = mntget(fc->root_mnt);
         fput(file);
 
+        ret = kaos_attach_anon_ns(real_mount(mnt));
+        if (ret) {
+                mntput(mnt);
+                KAOS_MNTAPI_LOG("fsmount fd=%d attach_anon_ns -> err=%d", fd, ret);
+                return ret;
+        }
+
+        KAOS_MNTAPI_LOG("fsmount fd=%d mnt=%p mnt_ns=%p shared=%d",
+                         fd, real_mount(mnt), real_mount(mnt)->mnt_ns,
+                         IS_MNT_SHARED(real_mount(mnt)));
+
         newfd = anon_inode_getfd("mount", &mount_fops, mnt,
                                  O_RDWR | (flags & FSMOUNT_CLOEXEC ? O_CLOEXEC : 0));
         if (newfd < 0)
-                mntput(mnt);
+                kaos_dissolve_detached_mnt(mnt);
+        KAOS_MNTAPI_LOG("fsmount fd=%d -> newfd=%d", fd, newfd);
         return newfd;
 }
 
@@ -3868,15 +4040,19 @@ SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, path, unsigned int, fl
                 fd = get_unused_fd_flags(flags & OPEN_TREE_CLOEXEC ? O_CLOEXEC : 0);
                 if (fd < 0) {
                         path_put(&p);
+                        KAOS_MNTAPI_LOG("open_tree(no-clone) dfd=%d flags=%u -> fd=%d", dfd, flags, fd);
                         return fd;
                 }
                 file = dentry_open(&p, O_PATH, current_cred());
                 path_put(&p);
                 if (IS_ERR(file)) {
                         put_unused_fd(fd);
+                        KAOS_MNTAPI_LOG("open_tree(no-clone) dfd=%d flags=%u -> err=%ld",
+                                         dfd, flags, PTR_ERR(file));
                         return PTR_ERR(file);
                 }
                 fd_install(fd, file);
+                KAOS_MNTAPI_LOG("open_tree(no-clone) dfd=%d flags=%u -> fd=%d", dfd, flags, fd);
                 return fd;
         }
 
@@ -3899,15 +4075,40 @@ SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, path, unsigned int, fl
                 mnt = clone_mnt(real_mount(p.mnt), p.dentry, CL_PRIVATE);
         namespace_unlock();
         path_put(&p);
-        if (IS_ERR(mnt))
+        if (IS_ERR(mnt)) {
+                KAOS_MNTAPI_LOG("open_tree(clone) dfd=%d flags=%u -> err=%ld",
+                                 dfd, flags, PTR_ERR(mnt));
                 return PTR_ERR(mnt);
+        }
+
+        error = kaos_attach_anon_ns(mnt);
+        if (error) {
+                /*
+                 * mnt_ns is still NULL here (attach itself is what failed),
+                 * so this isn't kaos_dissolve_detached_mnt()'s is_anon_ns()
+                 * case -- tear down directly, same as attach_recursive_mnt()'s
+                 * own out_cleanup_ids path does for an unattached tree.
+                 */
+                namespace_lock();
+                lock_mount_hash();
+                umount_tree(mnt, UMOUNT_SYNC);
+                unlock_mount_hash();
+                namespace_unlock();
+                KAOS_MNTAPI_LOG("open_tree(clone) dfd=%d attach_anon_ns -> err=%d", dfd, error);
+                return error;
+        }
+
+        KAOS_MNTAPI_LOG("open_tree(clone) dfd=%d flags=%u mnt=%p mnt_ns=%p shared=%d",
+                         dfd, flags, mnt, mnt->mnt_ns, IS_MNT_SHARED(mnt));
 
         fd = anon_inode_getfd("mount", &mount_fops, mnt,
                               O_RDWR | (flags & OPEN_TREE_CLOEXEC ? O_CLOEXEC : 0));
         if (fd < 0) {
-                mntput(&mnt->mnt);
+                kaos_dissolve_detached_mnt(&mnt->mnt);
+                KAOS_MNTAPI_LOG("open_tree(clone) dfd=%d -> fd=%d", dfd, fd);
                 return fd;
         }
+        KAOS_MNTAPI_LOG("open_tree(clone) dfd=%d -> fd=%d", dfd, fd);
         return fd;
 }
 
@@ -3952,10 +4153,19 @@ SYSCALL_DEFINE5(move_mount, int, from_dfd, const char __user *, from_path,
         if (IS_ERR(source_mnt))
                 return PTR_ERR(source_mnt);
 
+        /*
+         * Take our own reference to the source mount before releasing the
+         * file.  The fd may be closed by another thread while we sleep in
+         * user_path_at()/lock_mount(), and the mount fd release path would
+         * then drop the last reference and free a detached mount out from
+         * under us.
+         */
+        mntget(&source_mnt->mnt);
+
         /* Once attached, a mount fd cannot be moved again. */
         if (mnt_has_parent(source_mnt)) {
-                fput(file);
-                return -EBUSY;
+                ret = -EBUSY;
+                goto out_mntput;
         }
         fput(file);
 
@@ -3969,17 +4179,20 @@ SYSCALL_DEFINE5(move_mount, int, from_dfd, const char __user *, from_path,
 
         ret = user_path_at(to_dfd, to_path, lookup_flags, &p);
         if (ret)
-                return ret;
+                goto out_mntput;
 
         if (!may_mount()) {
                 path_put(&p);
-                return -EPERM;
+                ret = -EPERM;
+                goto out_mntput;
         }
 
         mp = lock_mount(&p);
         ret = PTR_ERR(mp);
-        if (IS_ERR(mp))
-                goto out;
+        if (IS_ERR(mp)) {
+                path_put(&p);
+                goto out_mntput;
+        }
 
         ret = -EINVAL;
         if (!check_mnt(real_mount(p.mnt)))
@@ -3987,11 +4200,22 @@ SYSCALL_DEFINE5(move_mount, int, from_dfd, const char __user *, from_path,
         if (d_is_dir(p.dentry) != d_is_dir(source_mnt->mnt.mnt_root))
                 goto out_unlock;
 
+        KAOS_MNTAPI_LOG("move_mount PRE attach source_mnt=%p src_mnt_ns=%p "
+                         "dest_mnt=%p(real_mount) dest_shared=%d dest_mnt_ns=%p",
+                         source_mnt, source_mnt->mnt_ns, real_mount(p.mnt),
+                         IS_MNT_SHARED(real_mount(p.mnt)), real_mount(p.mnt)->mnt_ns);
+
         ret = attach_recursive_mnt(source_mnt, real_mount(p.mnt), mp, NULL);
+
+        KAOS_MNTAPI_LOG("move_mount POST attach source_mnt=%p src_mnt_ns=%p ret=%d",
+                         source_mnt, source_mnt->mnt_ns, ret);
 out_unlock:
         unlock_mount(mp);
-out:
         path_put(&p);
+out_mntput:
+        mntput(&source_mnt->mnt);
+        KAOS_MNTAPI_LOG("move_mount from_dfd=%d to_dfd=%d flags=%u -> ret=%d",
+                         from_dfd, to_dfd, flags, ret);
         return ret;
 }
 
@@ -4147,6 +4371,9 @@ SYSCALL_DEFINE5(mount_setattr, int, dfd, const char __user *, path,
         if (err)
                 return err;
 
+        KAOS_MNTAPI_LOG("mount_setattr dfd=%d flags=%u attr_set=%llu attr_clr=%llu set=%u clr=%u",
+                         dfd, flags, attr.attr_set, attr.attr_clr, set, clr);
+
         if (!(flags & AT_SYMLINK_NOFOLLOW))
                 lookup_flags |= LOOKUP_FOLLOW;
         if (flags & AT_EMPTY_PATH)
@@ -4182,5 +4409,6 @@ SYSCALL_DEFINE5(mount_setattr, int, dfd, const char __user *, path,
         }
         namespace_unlock();
         path_put(&target);
+        KAOS_MNTAPI_LOG("mount_setattr dfd=%d -> err=%d", dfd, err);
         return err;
 }
