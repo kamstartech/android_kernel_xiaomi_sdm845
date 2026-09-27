@@ -26,6 +26,7 @@
 #include <linux/poll.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/magic.h>
 #include <linux/cred.h>
