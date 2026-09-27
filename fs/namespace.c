@@ -3729,6 +3729,24 @@ static int kaos_attach_anon_ns(struct mount *mnt)
         if (IS_ERR(ns))
                 return PTR_ERR(ns);
 
+        /*
+         * namespace_lock() (namespace_sem), not just lock_mount_hash()
+         * (the mount_lock seqlock): mainline's equivalent loop in
+         * open_detached_copy() holds both, because next_mnt() walks
+         * mnt_mounts/mnt_child links that every other mount-tree
+         * topology change (attach_recursive_mnt(), umount_tree(),
+         * propagate_mnt()) serializes on namespace_sem, not just the
+         * seqlock. Both open_tree() and fsmount() release namespace_lock()
+         * before calling here, so without this, the assignment loop below
+         * races against any concurrent mount/umount syscall from another
+         * task -- exactly the environment during a systemd boot with many
+         * services mounting concurrently. Root-caused live 2026-09-27:
+         * every kaos_dissolve_detached_mnt() crash this session hit the
+         * exact same offset (its final mntput() call), consistent with
+         * is_anon_ns(m->mnt_ns) seeing a corrupted/stale seq value rather
+         * than a random-looking crash site.
+         */
+        namespace_lock();
         lock_mount_hash();
         for (p = mnt; p; p = next_mnt(p, mnt)) {
                 p->mnt_ns = ns;
@@ -3737,6 +3755,9 @@ static int kaos_attach_anon_ns(struct mount *mnt)
         ns->root = mnt;
         list_add_tail(&ns->list, &mnt->mnt_list);
         unlock_mount_hash();
+        namespace_unlock();
+        KAOS_MNTAPI_LOG("attach_anon root=%p m=%p ns=%p seq=%llu",
+                         mnt, mnt, ns, ns->seq);
         return 0;
 }
 
@@ -3759,10 +3780,15 @@ static void kaos_dissolve_detached_mnt(struct vfsmount *mnt)
 {
         struct mount *m = real_mount(mnt);
         struct mnt_namespace *ns;
+        u64 dbg_seq = ~0ULL;
 
         namespace_lock();
         lock_mount_hash();
         ns = m->mnt_ns;
+        if (ns)
+                dbg_seq = ns->seq;
+        KAOS_MNTAPI_LOG("dissolve mnt=%p m=%p ns=%p seq=%llu anon=%d",
+                         mnt, m, ns, dbg_seq, ns ? is_anon_ns(ns) : -1);
         if (ns && is_anon_ns(ns))
                 umount_tree(m, UMOUNT_CONNECTED);
         else
