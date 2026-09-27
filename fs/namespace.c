@@ -4101,7 +4101,7 @@ SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, path, unsigned int, fl
         KAOS_MNTAPI_LOG("open_tree(clone) dfd=%d flags=%u mnt=%p mnt_ns=%p shared=%d",
                          dfd, flags, mnt, mnt->mnt_ns, IS_MNT_SHARED(mnt));
 
-        fd = anon_inode_getfd("mount", &mount_fops, mnt,
+        fd = anon_inode_getfd("mount", &mount_fops, &mnt->mnt,
                               O_RDWR | (flags & OPEN_TREE_CLOEXEC ? O_CLOEXEC : 0));
         if (fd < 0) {
                 kaos_dissolve_detached_mnt(&mnt->mnt);
@@ -4123,7 +4123,7 @@ static struct mount *mount_from_fd(int fd, struct file **filep)
                 fput(file);
                 return ERR_PTR(-EINVAL);
         }
-        mnt = file->private_data;
+        mnt = real_mount(file->private_data);
         *filep = file;
         return mnt;
 }
