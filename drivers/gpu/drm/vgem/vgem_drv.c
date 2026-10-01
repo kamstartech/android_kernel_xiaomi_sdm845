@@ -357,7 +357,27 @@ static void __exit vgem_exit(void)
 	drm_dev_unref(vgem_device);
 }
 
-module_init(vgem_init);
+/*
+ * Kaos: built-in (=y) vgem calls drm_dev_register() synchronously, right
+ * here, at device_initcall time. msm_drm/sde-kms's *real* display device
+ * registers later and asynchronously -- drm_dev_register() for it only
+ * fires once component_bind_all() resolves all of its sub-components
+ * (DSI panel, writeback pipe, RSC, ...), which depends on runtime
+ * clock/regulator/panel timing, not initcall level. Both drivers are
+ * competing for the same pool of low DRM minor numbers, so whichever
+ * finishes drm_dev_register() first wins minor 0. module_init (device_
+ * initcall) let vgem win that race often enough to grab card0 before
+ * msm_drm was ready -- confirmed live 2026-10-01: card0 ended up an
+ * orphaned vgem registration with no connectors, msm_drm's real display
+ * landed on card1, and trampoline's cold-boot ROM selector (which runs
+ * at t~16s, PID 1 intercept, before card1's device node even existed
+ * yet) found no usable DRM device at all and silently fell through to
+ * booting Android. late_initcall runs well after device_initcall, by
+ * which point sde-kms's component binding has always already completed
+ * on this SoC, so msm_drm now deterministically wins minor 0 every boot
+ * and vgem simply takes whatever's next.
+ */
+late_initcall(vgem_init);
 module_exit(vgem_exit);
 
 MODULE_AUTHOR("Red Hat, Inc.");
