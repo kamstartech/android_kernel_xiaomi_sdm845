@@ -36,6 +36,11 @@
 						 * be the modern (cgroup-field) size without hitting -E2BIG --
 						 * see the cgroup field comment on struct clone_args below and
 						 * sys_clone3()'s handling of it in kernel/fork.c. */
+#define CLONE_CLEAR_SIGHAND	0x100000000ULL	/* Clear any signal handler and reset to SIG_DFL.
+						 * Backported (Linux 5.5) -- glibc >=2.39's posix_spawn()
+						 * passes this via clone3() and relies on the kernel actually
+						 * honoring it instead of just accepting the bit; see
+						 * copy_sighand()'s handling in kernel/fork.c. */
 
 /*
  * Arguments for the clone3 syscall

@@ -1318,6 +1318,20 @@ static int copy_sighand(unsigned long clone_flags, struct task_struct *tsk)
 	spin_lock_irq(&current->sighand->siglock);
 	memcpy(sig->action, current->sighand->action, sizeof(sig->action));
 	spin_unlock_irq(&current->sighand->siglock);
+
+	/*
+	 * Reset all signal handlers not set to SIG_IGN to SIG_DFL, matching
+	 * mainline's copy_sighand(). Without this, CLONE_CLEAR_SIGHAND was
+	 * accepted (clone3_args_valid() never validated the flags bitmask)
+	 * but silently did nothing -- the memcpy() above always ran
+	 * unconditionally, so every clone3() child kept every one of the
+	 * parent's handlers regardless of this flag. glibc >=2.39's
+	 * posix_spawn() calls clone3() with exactly
+	 * CLONE_CLEAR_SIGHAND | CLONE_VM | CLONE_VFORK and assumes the
+	 * kernel actually clears them before the child can run any code.
+	 */
+	if (clone_flags & CLONE_CLEAR_SIGHAND)
+		flush_signal_handlers(tsk, 0);
 	return 0;
 }
 
@@ -2241,6 +2255,16 @@ SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
 static inline int clone3_args_valid(const struct clone_args *args)
 {
 	if (args->flags & (CLONE_DETACHED | CSIGNAL))
+		return -EINVAL;
+
+	/*
+	 * Sharing the parent's sighand struct (CLONE_SIGHAND) and asking to
+	 * clear it (CLONE_CLEAR_SIGHAND) are mutually exclusive -- there's
+	 * nothing to clear in a struct still shared with the parent. Matches
+	 * mainline's clone3_args_valid() exactly.
+	 */
+	if ((args->flags & (CLONE_SIGHAND | CLONE_CLEAR_SIGHAND)) ==
+	    (CLONE_SIGHAND | CLONE_CLEAR_SIGHAND))
 		return -EINVAL;
 
 	if ((args->flags & (CLONE_THREAD | CLONE_PARENT)) && args->exit_signal)
